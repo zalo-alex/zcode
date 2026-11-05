@@ -1,0 +1,9 @@
+/target
+/dist
+/bench/venv
+/bench/results
+/bench/*.log
+__pycache__/
+*.pyc
+*.bak
+/bench/results.json
