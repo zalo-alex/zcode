@@ -143,17 +143,19 @@ Every tool runs through a `Sandbox` (`crates/zcode-tools/src/sandbox.rs`): `exec
 Fail closed: if the requested tier cannot be enforced zcode refuses to run with an actionable error. With `--auto` (or `--require-sandbox`) tier 1 on an unsupported kernel is an error; without `--auto` it runs unconfined with one warning. `--sandbox warn` always runs unconfined with one warning instead of failing; `--sandbox none` opts out.
 
 **Tier 1 bash child** (set up in `pre_exec` from data built in the parent; the zcode process itself is never restricted):
-* Landlock, best ABI (raw syscalls, no allocation after fork): read-only `/usr /bin /sbin /lib* /etc`, the project root and the toolchain dirs (`~/.cargo ~/.rustup ~/.cache ~/.npm`, config key `toolchain_dirs`); read-write: write paths (`--allow-write`, default the project root), a private per-agent `TMPDIR` (mode 0700 under `$XDG_RUNTIME_DIR/zcode` or `/tmp/zcode-<uid>`), `/dev/null /dev/zero /dev/urandom /dev/random /dev/tty`. Only the child's own `/proc/<pid>` and a few global `/proc` files are readable. Nothing else in `$HOME` (so never `~/.config/zcode`, `~/.config/opencode`, `~/.ssh`). TCP bind/connect is denied on ABI 4+ when `net=false`; ABI 6 also scopes signals and abstract unix sockets.
+* Landlock, best ABI (raw syscalls, no allocation after fork): read-only `/usr /bin /sbin /lib* /etc`, the project root and the toolchain dirs (`~/.cargo ~/.rustup ~/.cache ~/.npm`, config key `toolchain_dirs`); read-write: write paths (`--allow-write`, default the project root), a private per-agent `TMPDIR` (mode 0700 under `$XDG_RUNTIME_DIR/zcode` or `/tmp/zcode-<uid>`), `/dev/null /dev/zero /dev/urandom /dev/random /dev/tty`. The target of `/etc/resolv.conf` is readable too when it is a symlink out of `/etc` (systemd-resolved, WSL), otherwise no hostname resolves even with `--net`. Only the child's own `/proc/<pid>` and a few global `/proc` files are readable. Nothing else in `$HOME` (so never `~/.config/zcode`, `~/.config/opencode`, `~/.ssh`). TCP bind/connect is denied on ABI 4+ when `net=false`; ABI 6 also scopes signals and abstract unix sockets.
 * seccomp denylist: `ptrace process_vm_readv/writev mount umount2 pivot_root unshare setns bpf keyctl add_key request_key kexec_load perf_event_open io_uring_* userfaultfd`; with `net=false` also `socket(AF_INET|AF_INET6)` (works on every kernel, covers UDP). `no_new_privs` is set.
 * Environment: `env_clear()` plus `PATH HOME LANG LC_ALL TERM USER TMPDIR CARGO_HOME RUSTUP_HOME` and names listed in config `sandbox_env` (names containing `KEY`/`TOKEN`/`SECRET`/`PASSWORD` or starting `ZCODE_`/`OPENCODE_` are never passed).
 * A policy whose roots contain an always-denied directory (e.g. running in `$HOME` with `~/.ssh`) is refused: Landlock cannot carve holes.
 * Startup cost: the kernel probe and this policy check run when the session opens (so an unenforceable tier fails immediately); opening the rule fds and compiling the seccomp filter wait for the first `bash` call, so an idle session never pays for them.
 
+A write path (`--allow-write`, a worker's `write`) may be a single file: that file is then writable and nothing next to it.
+
 **Tier 1 file tools** run in the zcode process, so the policy is enforced in userland: every open is `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` under an allowed root and the resulting fd is re-checked against the deny list (config dir, `~/.ssh`, `/proc`, `/sys`, and the rest of `$HOME` unless a deeper root covers it). `--allow-outside` / `--auto` widen the file tools to `/` minus the deny list; they do **not** widen bash (use `--allow-write`).
 
 **Stale-edit detection**: each read records a content hash; `write`/`edit`/`multiedit` fail with `modified by another agent, re-read` if the file changed since.
 
-Tier 2 (containers, images, guest protocol, profiles) is documented in [TIER2.md](TIER2.md), the daemon and its protocol in [DAEMON.md](DAEMON.md), and what is missing or different from the plan in [DEVIATIONS.md](DEVIATIONS.md).
+Tier 2 (containers, images, guest protocol, profiles) is documented in [TIER2.md](TIER2.md), the daemon and its protocol in [DAEMON.md](DAEMON.md), and what is missing, partial or inherently limited in [KNOWN_GAPS.md](KNOWN_GAPS.md).
 
 ## Safety model
 

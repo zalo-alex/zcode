@@ -9,7 +9,7 @@ One 8 MB binary. 2 ms startup. ~30 MB of RAM. Any OpenAI-compatible model.
 ![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square&logo=rust&logoColor=white)
 ![platform](https://img.shields.io/badge/linux-x86__64%20%7C%20aarch64-black?style=flat-square&logo=linux&logoColor=white)
-![tests](https://img.shields.io/badge/tests-57%20passing-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-107%20passing-brightgreen?style=flat-square)
 
 [Install](#-install) · [Quick start](#-quick-start) · [Features](#-features) · [Benchmarks](#-benchmarks) · [Docs](#-docs)
 
@@ -141,9 +141,9 @@ Any OpenAI-compatible `/chat/completions` endpoint with streaming and tool calls
 
 - **Permissions:** `write`, `edit` and `bash` ask `y / N / always`. `--auto` skips prompts. Obvious disasters (`rm -rf /`, `mkfs`, …) are always blocked.
 - **Confinement:** writes outside the working directory need `--auto` or `--allow-outside`.
-- **Sandbox (tier 1, default):** the bash child runs under Landlock + seccomp: it only sees the project, system dirs and toolchains read-only, a private tmp, no `$HOME` secrets, no network unless `--net`, no `ptrace`/`mount`. File tools are path-checked with `openat2(RESOLVE_BENEATH)`. `--sandbox none` opts out; unsupported kernels fail closed (see `docs/PROTOCOL.md`).
-- **Daemon (opt-in, `zcode serve`):** one resident process hosting many instances on a shared bus and model-connection pool; clients (including `zcode run --auto`) create, attach and detach by id. See `docs/DAEMON.md`.
-- **Tier 2 (opt-in, `--sandbox container`):** one rootless crun container per agent with its own root filesystem, namespaces and network (`pasta` or `slirp4netns`); only the project dir is shared (read-only unless assigned). Images: `zcode image import`, or `zcode image pull alpine` (build with `--features oci` for the in-process registry client). See `docs/TIER2.md`.
+- **Sandbox (tier 1, default):** the bash child runs under Landlock + seccomp: it only sees the project, system dirs and toolchains read-only, a private tmp, no `$HOME` secrets, no network unless `--net`, no `ptrace`/`mount`. File tools are path-checked with `openat2(RESOLVE_BENEATH)`. `--sandbox none` opts out; unsupported kernels fail closed (see `docs/technical/PROTOCOL.md`).
+- **Daemon (opt-in, `zcode serve`):** one resident process hosting many instances on a shared bus and model-connection pool; clients (including `zcode run --auto`) create, attach and detach by id. See `docs/technical/DAEMON.md`.
+- **Tier 2 (opt-in, `--sandbox container`):** one rootless crun container per agent with its own root filesystem, namespaces and network (`pasta` or `slirp4netns`); only the project dir is shared (read-only unless assigned). Images: `zcode image import`, or `zcode image pull alpine` (build with `--features oci` for the in-process registry client). See `docs/technical/TIER2.md`.
 - **Swarm (opt-in, `--max-workers N`):** the lead can `spawn` workers that run in the same process, each with its own sandbox, history and write paths, and coordinate through `send` / `wait`. Budgets cover the whole swarm.
 - **Injection guard:** instruction-like text in files, web pages or command output (“ignore the user…”) is tagged as untrusted data, and mutating tools are denied for the rest of that turn. Tune with `--guard ask|deny|warn|off`.
 - **Runaway protection:** identical-call detection, an exploration-loop breaker, and limits on time, steps and tokens (`--max-time`, `--max-steps`, `--max-tokens`). Hitting a limit exits with code `3`.
@@ -161,7 +161,8 @@ Measured on one machine against one free model: zcode matched opencode on task q
 
 ## 📚 Docs
 
-- **[docs/PROTOCOL.md](docs/PROTOCOL.md)**: every flag, config key, environment variable, JSON event, exit code, and the session format.
+- **[User guide](docs/user/README.md)**: install, everyday use, the sandbox, teams of agents, containers and the daemon, with commands and their output.
+- **[Technical docs](docs/technical/README.md)**: every flag, config key, environment variable, JSON event, exit code, the guest and daemon protocols, and known gaps.
 - **Config layers** (later wins): `~/.config/opencode/opencode.json` → `~/.config/zcode/config.json` → env `OPENCODE_CONFIG_CONTENT` → env `ZCODE_CONFIG_CONTENT`.
 - **Instructions:** `~/.config/zcode/AGENTS.md`, `~/.config/opencode/AGENTS.md` and the nearest project `AGENTS.md` / `CLAUDE.md` are all added to the system prompt.
 
