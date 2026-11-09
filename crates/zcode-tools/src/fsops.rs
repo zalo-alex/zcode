@@ -64,7 +64,9 @@ impl LocalFs {
     }
 
     fn write_bytes(&self, p: &Path, content: &[u8]) -> Result<PathBuf> {
-        if let Some(d) = p.parent() {
+        // an existing parent is not re-checked: a file may be a write root on its own (a worker assigned `test.py`), and the
+        // open below is confined to the policy anyway
+        if let Some(d) = p.parent().filter(|d| !d.is_dir()) {
             match &self.guard {
                 Some(g) => g.mkdir_p(d).map_err(|e| anyhow!("{}", clean(e, p)))?,
                 None => std::fs::create_dir_all(d)?,

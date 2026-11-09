@@ -60,6 +60,38 @@ async fn cannot_read_outside_or_write_outside() {
 }
 
 #[tokio::test]
+async fn the_resolver_config_is_readable_even_when_it_is_a_symlink_out_of_etc() {
+    let Some(t) = setup("dns", false) else { return };
+    if !Path::new("/etc/resolv.conf").exists() { eprintln!("SKIP: no /etc/resolv.conf"); return; }
+    let (o, c) = sh(&t, "cat /etc/resolv.conf >/dev/null && echo readable").await;
+    assert!(c == 0 && o.contains("readable"), "/etc/resolv.conf (-> {:?}) must stay readable or DNS breaks under --net: {o}", std::fs::canonicalize("/etc/resolv.conf"));
+    t.sb.close().await;
+}
+
+#[tokio::test]
+async fn a_single_file_can_be_the_write_root() {
+    let (work, _) = dirs("onefile");
+    std::fs::write(work.join("mine.txt"), "one
+").unwrap();
+    std::fs::write(work.join("theirs.txt"), "one
+").unwrap();
+    let mut p = Policy::new(work.clone());
+    p.write = vec![work.join("mine.txt")];
+    let sb = match LocalSandbox::open_tier1(p) { Ok(s) => s, Err(e) => { eprintln!("SKIP: tier 1 unavailable: {e}"); return; } };
+    let fs = sb.fs();
+    for f in ["mine.txt", "theirs.txt"] { fs.read(&json!({"path": f})).await.unwrap(); }
+    fs.edit(&json!({"path":"mine.txt","old_string":"one","new_string":"two"})).await.expect("the assigned file is editable");
+    assert_eq!(std::fs::read_to_string(work.join("mine.txt")).unwrap(), "two
+");
+    let e = fs.edit(&json!({"path":"theirs.txt","old_string":"one","new_string":"two"})).await.unwrap_err().to_string();
+    assert!(e.contains("blocked"), "{e}");
+    assert!(fs.write(&json!({"path":"brand-new.txt","content":"x"})).await.is_err(), "no new files next to it");
+    assert_eq!(std::fs::read_to_string(work.join("theirs.txt")).unwrap(), "one
+");
+    sb.close().await;
+}
+
+#[tokio::test]
 async fn symlink_and_dotdot_escapes_are_blocked() {
     let Some(t) = setup("esc", false) else { return };
     std::os::unix::fs::symlink(&t.other, t.work.join("link")).unwrap();

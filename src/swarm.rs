@@ -456,8 +456,9 @@ async fn worker_loop(mut agent: Agent, sw: Arc<Swarm>, name: String, first: Stri
         let text = match res {
             Ok(o) => match &o.stop {
                 Stop::Done => o.text,
-                Stop::Limit(w) => format!("{}\n[stopped: {w}]", o.text),
-                Stop::Interrupted => format!("{}\n[interrupted]", o.text),
+                // a worker that stopped before saying anything reports just the reason
+                Stop::Limit(w) => format!("{}\n[stopped: {w}]", o.text).trim_start().to_string(),
+                Stop::Interrupted => format!("{}\n[interrupted]", o.text).trim_start().to_string(),
             },
             Err(e) => format!("Error: {e}"),
         };

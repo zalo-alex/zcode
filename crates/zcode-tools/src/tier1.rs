@@ -118,6 +118,9 @@ impl Prepared {
         roots_ro.push(p.cwd.clone());
         for d in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc"] { roots_ro.push(d.into()); }
         roots_ro.extend(p.toolchain.iter().cloned());
+        // /etc/resolv.conf is usually a symlink out of /etc (systemd-resolved: /run/systemd/resolve/..., WSL: /mnt/wsl/...);
+        // without its target readable no hostname resolves, even with --net
+        if let Ok(t) = std::fs::canonicalize("/etc/resolv.conf") && !t.starts_with("/etc") { roots_ro.push(t); }
         (roots_rw, roots_ro)
     }
 

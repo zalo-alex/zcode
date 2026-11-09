@@ -13,8 +13,11 @@ const RESOLVE_BENEATH: u64 = 0x08;
 struct Root {
     path: PathBuf,
     write: bool,
+    /// a directory fd; for a `file` root, the fd of its parent directory
     fd: OwnedFd,
     depth: usize,
+    /// the root is a single file (a worker assigned `test.py`), not a directory
+    file: bool,
 }
 
 pub struct PathGuard {
@@ -83,9 +86,11 @@ impl PathGuard {
         let mut roots: Vec<Root> = vec![];
         let mut add = |path: PathBuf, write: bool| {
             let path = canon(&path);
+            let d = depth(&path);
             if let Ok(fd) = open_dirfd(&path) {
-                let d = depth(&path);
-                roots.push(Root { path, write, fd, depth: d });
+                roots.push(Root { path, write, fd, depth: d, file: false });
+            } else if path.is_file() && let Some(Ok(fd)) = path.parent().map(open_dirfd) {
+                roots.push(Root { path, write, fd, depth: d, file: true });
             }
         };
         for d in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc"] { add(d.into(), false); }
@@ -116,7 +121,7 @@ impl PathGuard {
         let abs = canon_prefix(abs);
         let root = self.pick(&abs, write).ok_or_else(|| denied_err(&abs))?;
         if self.denied(&abs, root.depth) { return Err(denied_err(&abs)); }
-        let rel = abs.strip_prefix(&root.path).unwrap_or(Path::new("")).to_path_buf();
+        let rel = if root.file { root.path.file_name().map(PathBuf::from).unwrap_or_default() } else { abs.strip_prefix(&root.path).unwrap_or(Path::new("")).to_path_buf() };
         Ok((root, rel))
     }
 
