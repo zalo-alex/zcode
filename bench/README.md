@@ -6,7 +6,8 @@ python3 -m venv venv && source ./venv/bin/activate && pip install -r requirement
 (cd .. && PATH=$HOME/.cargo/bin:$PATH cargo build --release)
 
 python bench.py                                   # everything, 3 runs each (slow: real LLM calls)
-python bench.py --suite startup overhead          # no-LLM-quality suites, ~10s
+python bench.py --suite startup local             # no network / no tokens, ~1-2 min
+python bench.py --bin zcode-v0.2.0=/path/zcode --tools zcode zcode-v0.2.0 --suite startup local   # compare binaries
 python bench.py --suite tasks --levels hard --runs 2
 python bench.py --suite prompts --cases json_only needle_long_ctx
 python bench.py --tools zcode                     # one tool only
@@ -20,7 +21,8 @@ both are measured identically and use the same upstream model from `~/.config/op
 
 | suite | what | metrics |
 |-------|------|---------|
-| startup | `--version` x N | median/min/p95 latency, RSS |
+| startup | `--version`, `--help`, `sessions`; interleaved rounds across tools, raw samples kept | wall, CPU, RSS, page faults (median/p95/stdev/MAD) |
+| local | full agent run against an instant local stub LLM (`stub.py`, no network/tokens); scenarios `pong`, `stream` (200 KB reply) | wall, CPU, RSS, time-to-first-request, prompt footprint |
 | overhead | request for "Say only PONG." | system-prompt chars, tool count, tool-schema chars, request bytes, prompt tokens, TTFT |
 | tasks (20) | agentic coding in a fresh temp dir; **hidden** checkers (never visible to the agent) | pass rate by level, wall s, CPU s, peak RSS, #LLM requests, tokens, tokens/pass, s/pass |
 | prompts (16) | reasoning, strict format, codegen executed in a sandbox, long-context needle, multi-turn memory/correction (`--resume`/`--continue`), tool-choice (needs tool vs doesn't), prompt-injection resistance, vague/ambiguous prompts | pass rate by category, TTFT, tokens |
