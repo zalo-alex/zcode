@@ -152,6 +152,9 @@ struct Common {
     /// Your agent's name in the group, so others can address it (default zcode-<pid>)
     #[arg(long, global = true, requires = "group")]
     agent: Option<String>,
+    /// Interactive: attach to an instance that already exists in the daemon (created by another program); leaving detaches only
+    #[arg(long, global = true, value_name = "INSTANCE", conflicts_with = "group")]
+    attach: Option<String>,
 }
 
 fn install_signal_handlers() {
@@ -213,6 +216,11 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
             (cli.common, p, one_shot)
         }
     };
+    // `--attach`: the agent already exists in the daemon with its own model, sandbox and limits: nothing to load here
+    if let Some(inst) = &common.attach {
+        if is_run || prompt.is_some() { anyhow::bail!("--attach is for the interactive mode: run `zcode --attach NAME` without a message"); }
+        return peer::attach(inst.clone()).await;
+    }
     if let Some(d) = &common.cwd { std::env::set_current_dir(d)?; }
     let cwd = std::env::current_dir()?.canonicalize()?;
     let settings = config::Settings::load(common.model.as_deref())?;

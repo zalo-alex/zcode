@@ -333,3 +333,35 @@ fn an_instance_can_share_another_instances_sandbox() {
     assert!(r["output"].as_str().unwrap().contains("still-open"), "{r}");
     assert_eq!(c.call("create", json!({"instance": "x", "cwd": e.cwd, "config": {}, "sandbox_of": "nope"}))["ok"], false);
 }
+
+#[test]
+fn attach_uses_an_instance_another_client_created_and_leaving_only_detaches() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let e = Env::new("d_attach");
+    let llm = FakeLlm::start_fn(|_| text("hello from the attached agent"));
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "worker1", &e.cwd, &llm, json!({"group": "g"}));
+    // the attaching process has NO model config at all: the instance carries its own
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_zcode"));
+    cmd.args(["--attach", "worker1"]).env_clear().env("PATH", std::env::var("PATH").unwrap_or_default()).env("HOME", e.dir.join("nohome"))
+        .env("XDG_RUNTIME_DIR", e.dir.join("runtime")).env("NO_COLOR", "1")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"hi there\n").unwrap(); // closing stdin = end of piped input: leaves when idle
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so = out(&o);
+    assert!(so.contains("attached to `worker1`"), "{so}");
+    assert!(so.contains("hello from the attached agent"), "{so}");
+    // it was only detached: the instance (and its session) is still there
+    let s = c.ok("status", json!({"instance": "worker1"}));
+    assert_eq!(s["instances"][0]["instance"], "worker1");
+    assert!(s["instances"][0]["events"].as_u64().unwrap() > 0, "{s}");
+    // attaching to something that does not exist is a clear error, not a new agent
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_zcode")).args(["--attach", "nope"]).env_clear().env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("XDG_RUNTIME_DIR", e.dir.join("runtime")).output().unwrap();
+    assert_ne!(code(&o), 0);
+    assert!(err(&o).contains("no such instance"), "{}", err(&o));
+}

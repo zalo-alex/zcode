@@ -2,6 +2,9 @@
 //! group with other agents. Everything the agent does is shown here as it happens, including what it does when another
 //! agent's message wakes it; your own lines are queued while it is busy. The agents message each other through the
 //! group's in-memory bus inside the daemon; this process only carries your keystrokes and renders events.
+//!
+//! `zcode --attach INSTANCE` is the same interface for an instance that something else already created (a program driving the
+//! daemon): it only attaches, and leaving does not close the instance.
 use crate::client::client_config;
 use crate::config::Settings;
 use crate::style::Paint;
@@ -62,13 +65,36 @@ fn names(agents: &Value) -> Vec<String> {
     agents.as_array().into_iter().flatten().filter_map(|l| l.as_str()?.split_whitespace().next().map(String::from)).filter(|n| n != "swarm").collect()
 }
 
-pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
+async fn connect(n: &mut u64) -> anyhow::Result<UnixStream> {
     let path = crate::serve::socket_path();
     let mut s = UnixStream::connect(&path).await.map_err(|_| anyhow::anyhow!("no zcode daemon is running at {}; start one with `zcode serve`", path.display()))?;
-    let mut n = 0u64;
     if let (Ok(app), Ok(tok)) = (std::env::var("ZCODE_APP"), std::env::var("ZCODE_APP_TOKEN")) {
-        call(&mut s, &mut n, "hello", json!({"app": app, "token": tok})).await.map_err(|e| anyhow::anyhow!("daemon rejected the app token: {e}"))?;
+        call(&mut s, n, "hello", json!({"app": app, "token": tok})).await.map_err(|e| anyhow::anyhow!("daemon rejected the app token: {e}"))?;
     }
+    Ok(s)
+}
+
+/// Attach to an instance that already exists (created by another client) and use it interactively. Leaving detaches only.
+pub async fn attach(name: String) -> anyhow::Result<i32> {
+    let mut n = 0u64;
+    let mut s = connect(&mut n).await?;
+    let st = call(&mut s, &mut n, "status", json!({"instance": name})).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let i = &st["instances"][0];
+    let built = call(&mut s, &mut n, "build", json!({"instance": name})).await.map_err(anyhow::Error::msg)?;
+    call(&mut s, &mut n, "attach", json!({"instance": name})).await.map_err(anyhow::Error::msg)?;
+    let group = i["group"].as_str().unwrap_or("").to_string();
+    let banner = vec![
+        format!("{} {} · {}", "zcode".bold().cyan(), env!("CARGO_PKG_VERSION"), i["cwd"].as_str().unwrap_or("")),
+        format!("{}", format!("attached to `{name}`{} · auto-approve · leaving detaches, the agent keeps running", if group.is_empty() { String::new() } else { format!(" (group `{group}`)") }).dimmed()),
+        format!("{}", format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed()),
+        format!("{}", HELP.dimmed()),
+    ];
+    interact(s, n, name, group, banner, false).await
+}
+
+pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
+    let mut n = 0u64;
+    let mut s = connect(&mut n).await?;
     let mut create = json!({"instance": j.name, "cwd": j.cwd, "config": client_config(j.settings), "sandbox": j.sandbox, "require_sandbox": j.require_sandbox,
         "policy": j.policy, "group": j.group, "max_workers": j.max_workers, "stream": true, "close_on_disconnect": true,
         "limits": {"max_time": j.max_time.unwrap_or(0), "max_steps": j.max_steps, "max_tokens": j.max_tokens}});
@@ -81,7 +107,18 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
         Err(e) => { let _ = call(&mut s, &mut n, "close", json!({"instance": j.name})).await; anyhow::bail!("{e}"); }
     };
     call(&mut s, &mut n, "attach", json!({"instance": j.name})).await.map_err(anyhow::Error::msg)?;
+    let banner = vec![
+        format!("{} {} · {} · {}", "zcode".bold().cyan(), env!("CARGO_PKG_VERSION"), j.settings.main.model, j.cwd.display()),
+        format!("{}", format!("joined group `{}` as `{}` · auto-approve · sandbox {}", j.group, j.name, j.sandbox).dimmed()),
+        format!("{}", format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed()),
+        format!("{}", "your agent can message the others with send; what they send back shows up here as it arrives".dimmed()),
+        format!("{}", HELP.dimmed()),
+    ];
+    interact(s, n, j.name, j.group, banner, true).await
+}
 
+/// The prompt loop, shared by `run` and `attach`. `close` = end the instance on exit (the agent we created), else just detach.
+async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Vec<String>, close: bool) -> anyhow::Result<i32> {
     // keyboard: a thread (readline blocks), or plain lines when stdin is not a terminal
     let tty = std::io::stdin().is_terminal();
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Input>();
@@ -112,17 +149,13 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
     };
     let mut out = Out { printer };
 
-    println!("{} {} · {} · {}", "zcode".bold().cyan(), env!("CARGO_PKG_VERSION"), j.settings.main.model, j.cwd.display());
-    println!("{}", format!("joined group `{}` as `{}` · auto-approve · sandbox {}", j.group, j.name, j.sandbox).dimmed());
-    println!("{}", format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed());
-    println!("{}", "your agent can message the others with send; what they send back shows up here as it arrives".dimmed());
-    println!("{}", HELP.dimmed());
+    for l in &banner { println!("{l}"); }
 
     let (mut rd, wr) = s.into_split();
     let (fr_tx, mut fr_rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(async move { while let Ok(v) = read_frame(&mut rd).await { if fr_tx.send(v).is_err() { break; } } });
 
-    let mut p = Peer { name: j.name.clone(), group: j.group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false };
+    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false };
     let mut code = 0;
     loop {
         tokio::select! {
@@ -142,8 +175,8 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
         // end of piped input: leave once the agent has nothing left to do
         if p.eof && !p.busy && p.pending.is_empty() { break; }
     }
-    // leave the group: the daemon closes this agent (its session stays on disk)
-    p.send("close", json!({})).await;
+    // leave: a group agent we created is closed by the daemon (its session stays on disk); an attached one only detaches
+    p.send(if close { "close" } else { "detach" }, json!({})).await;
     let _ = tokio::time::timeout(Duration::from_secs(3), async { while let Some(v) = fr_rx.recv().await { if v.get("req").is_some() && v["req"] == p.n { break; } } }).await;
     Ok(code)
 }
@@ -163,6 +196,8 @@ struct Peer {
     tin: u64,
     tout: u64,
     eof: bool,
+    /// this step already streamed its text (`text` repeats it at the end of the step)
+    streamed: bool,
 }
 
 impl Peer {
@@ -224,8 +259,11 @@ impl Peer {
         }
         let mine = v["agent"].as_str() == Some(self.name.as_str());
         match v["type"].as_str().unwrap_or("") {
-            "step_start" if mine => self.busy = true,
+            "step_start" if mine => { self.busy = true; self.streamed = false; }
+            // an instance created without `stream`: the whole text of a step arrives at once
+            "text" if mine && !self.streamed => { for l in v["part"]["text"].as_str().unwrap_or("").lines() { out.line(l); } }
             "text_delta" if mine => {
+                self.streamed = true;
                 self.buf.push_str(v["delta"].as_str().unwrap_or(""));
                 while let Some(i) = self.buf.find('\n') { let line: String = self.buf.drain(..=i).collect(); out.line(line.trim_end_matches('\n')); }
             }

@@ -39,6 +39,8 @@ Config (`serve` key of the daemon's own config): `max_instances` (64), `max_hist
 
 `zcode --group NAME [--agent AGENT] --auto` is a client of this protocol for people: it `create`s an instance named after the agent with `group`, `stream: true` and `close_on_disconnect: true`, calls `build` so the agent is in the group and answers messages at once, `attach`es, and then forwards each line you type as a `prompt` and renders the event stream. It needs a running daemon (`zcode serve`) and `--auto`, because the daemon cannot ask for permission.
 
+`zcode --attach INSTANCE` is the same interface for an instance another client already created (with its own model, sandbox and limits): it loads no config, only `status`/`build`/`attach`es and forwards lines as `prompt`s, and leaving sends `detach`, never `close`. Instances created without `stream` show each step's text at once instead of streaming.
+
 Agents of one group share one bus: `send(to, text)` reaches any agent of the group by its instance name, and a message to an idle agent wakes it (the daemon starts a turn: `[from name] ...`), whether or not anyone is typing at it. Group specifics:
 
 * The group has no swarm-wide step, token or time budget (each turn keeps its own `limits`): groups are long-lived.
