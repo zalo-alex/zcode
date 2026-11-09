@@ -23,7 +23,8 @@ Config (`serve` key of the daemon's own config): `max_instances` (64), `max_hist
 | op | fields | notes |
 |---|---|---|
 | `hello` | `app`, `token` | only needed when `serve.apps` is set; instances and groups are namespaced per app |
-| `create` | `instance`, `cwd`, `config`, `model?`, `sandbox?` (default `landlock`), `profile?`, `policy?` `{read,write,net,outside}`, `limits?` `{max_time,max_steps,max_tokens}`, `group?`, `max_workers?`, `stream?`, `session?`, `close_on_disconnect?` | allocation only: no model client, sandbox, session file or agent exists until the first `prompt`/`send`/`spawn`. Instance and group names are `[A-Za-z0-9_-]{1,32}` |
+| `create` | `instance`, `cwd`, `config`, `model?`, `sandbox?` (default `landlock`), `profile?`, `policy?` `{read,write,net,outside}`, `limits?` `{max_time,max_steps,max_tokens}`, `sandbox_of?` (name of another instance of this app: share its sandbox/container instead of opening one; closing this instance leaves it open), `container?` `{image, mem, cpus, pids, ports, custom}` (tier 2 only; `custom` is the `container` customization object: `mounts`, `env`, `tmpfs`, ...; layered over the daemon's own `container` config), `group?`, `max_workers?`, `stream?`, `session?`, `close_on_disconnect?` | allocation only: no model client, sandbox, session file or agent exists until the first `prompt`/`send`/`spawn`. Instance and group names are `[A-Za-z0-9_-]{1,32}` |
+| `exec` | `instance`, `command`, `timeout?` (s, default 120, max 3600), `background?` | run one shell command in the instance's sandbox (tier 2: inside its container) and reply `{code, timed_out, output}`. Builds the instance if needed. It shares the agent's persistent shell: wrap state-changing commands in a subshell |
 | `build` | `instance` | build the instance now (model client, sandbox, agent, joining its group, so that it can receive messages) instead of at the first `prompt`/`send`/`spawn`. Replies `{agents: [...]}`, the group's agents as `/agents` lists them |
 | `attach` | `instance`, `since?` | subscribes this connection to the instance's events; the ring is replayed first (events with `seq > since`) |
 | `detach` | `instance` | |
@@ -32,7 +33,7 @@ Config (`serve` key of the daemon's own config): `max_instances` (64), `max_hist
 | `spawn` | `instance`, `name`, `prompt`, `write?`, `profile?` | same semantics as the tool |
 | `cancel` | `instance` | interrupts the running turn (`turn_end` with `stop: "interrupted"`) |
 | `close` | `instance` | stops workers, closes sandboxes/containers, forgets the instance |
-| `status` | `instance?` | state, queue, per-agent budgets (as `/agents`) |
+| `status` | `instance?` | state, queue, per-agent budgets (as `/agents`); per instance also `pid` (host pid of the tier 2 container init, for `nsenter`) and `ports` (`[{guest, host}]`) |
 
 ## Interactive agents in a group (`zcode --group`)
 

@@ -57,6 +57,10 @@ struct Params {
     stream: bool,
     session: String,
     swarm: Value,
+    /// per-instance tier 2 options: `{image, mem, cpus, pids, ports, custom: {mounts, env, ...}}`
+    container: Value,
+    /// run in another instance's sandbox (same container, same shell state) instead of opening one
+    sandbox_of: Option<String>,
 }
 
 #[derive(Default)]
@@ -129,8 +133,27 @@ impl Daemon {
         policy.net = pol.get("net").and_then(|v| v.as_bool()).unwrap_or(false);
         policy.outside = pol.get("outside").and_then(|v| v.as_bool()).unwrap_or(false);
         policy.scrub_env = true; // tools never inherit the daemon's environment
-        let copts = tools::ContainerOpts { agent: inst.name.clone(), net: policy.net, project_rw: true, ..Default::default() };
-        let (sandbox, warning) = tools::open_with(p.mode, policy.clone(), true, p.require_sandbox, copts).map_err(|e| e.to_string())?;
+        let ct = &p.container;
+        let copts = tools::ContainerOpts {
+            agent: inst.name.clone(),
+            image: ct.get("image").and_then(|v| v.as_str()).map(String::from),
+            net: policy.net,
+            mem: ct.get("mem").and_then(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string()))).and_then(|s| tools::container::parse_size(&s)),
+            cpus: ct.get("cpus").and_then(|v| v.as_f64()),
+            pids: ct.get("pids").and_then(|v| v.as_u64()),
+            ports: ct.get("ports").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|p| p as u16)).collect()).unwrap_or_default(),
+            project_rw: true,
+            custom: ct.get("custom").cloned(),
+        };
+        let (sandbox, warning) = match &p.sandbox_of {
+            Some(src) => {
+                let s = self.find(&inst.app, src)?;
+                Box::pin(self.ensure_built(&s)).await?;
+                let sb = s.sandbox.lock().unwrap().clone().ok_or("`sandbox_of` instance has no sandbox")?;
+                (sb, None)
+            }
+            None => tools::open_with(p.mode, policy.clone(), true, p.require_sandbox, copts).map_err(|e| e.to_string())?,
+        };
         let net = policy.net || p.mode == Mode::None;
         let ctx = Arc::new(tools::Ctx::with_sandbox(sandbox.clone(), net));
         let mut agent = Agent::new(client.clone(), ctx, AgentOpts {
@@ -241,14 +264,14 @@ impl Daemon {
         inst.cancel.cancel();
         let sw = inst.swarm.lock().unwrap().take();
         if let Some(sw) = sw {
-            sw.remove_root(&inst.name).await;
+            sw.remove_root(&inst.name, inst.p.sandbox_of.is_none()).await;
             if let Some(g) = &inst.p.group {
                 let key = Self::ns(app, g);
                 if !sw.has_roots() { self.groups.lock().unwrap().remove(&key); }
             }
         }
         let sb = inst.sandbox.lock().unwrap().take();
-        if let Some(sb) = sb { sb.close().await; }
+        if let (Some(sb), None) = (sb, &inst.p.sandbox_of) { sb.close().await; } // a shared sandbox belongs to its source instance
         inst.push_event(json!({"type": "closed"}));
         Ok(())
     }
@@ -302,6 +325,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
         "create" => {
             let name = str_of(req, "instance")?;
             if !valid_name(name) { return Err("instance must be [A-Za-z0-9_-]{1,32}".into()); }
+            if let Some(src) = req["sandbox_of"].as_str() { d.find(app, src)?; }
             let cwd = PathBuf::from(str_of(req, "cwd")?);
             if !cwd.is_absolute() || !cwd.is_dir() { return Err("cwd must be an existing absolute directory".into()); }
             let cwd = cwd.canonicalize().map_err(|e| e.to_string())?;
@@ -324,7 +348,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
                 name: name.to_string(), app: app.to_string(),
                 p: Params { cwd, config: req["config"].clone(), model: req["model"].as_str().map(String::from), mode, require_sandbox: req["require_sandbox"].as_bool().unwrap_or(false),
                     policy: req["policy"].clone(), limits, group, max_workers: req["max_workers"].as_u64().unwrap_or(0) as usize, stream: req["stream"].as_bool().unwrap_or(false),
-                    session: session.clone(), swarm: req["swarm"].clone() },
+                    session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from) },
                 agent: Mutex::new(None), build: tokio::sync::Mutex::new(false), running: AtomicBool::new(false), crashed: AtomicBool::new(false),
                 swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), buf: Mutex::new(EventBuf::default()), tx: btx, ring_cap: d.cfg.ring,
             });
@@ -392,6 +416,20 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             let r = events::SINK.scope(sink, sw.spawn(&inst.name, str_of(req, "name")?, str_of(req, "prompt")?, &write, req["profile"].as_str())).await;
             r.map(|m| json!({"result": m}))
         }
+        "exec" => {
+            // run one shell command in the instance's sandbox (tier 2: inside its container) and return the output.
+            // It shares the agent's persistent shell, so wrap state-changing commands in a subshell.
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            let command = str_of(req, "command")?.to_string();
+            d.ensure_built(&inst).await?;
+            let sb = inst.sandbox.lock().unwrap().clone().ok_or("instance has no sandbox")?;
+            sb.ready().await.map_err(|e| e.to_string())?;
+            let timeout = Duration::from_secs(req["timeout"].as_u64().filter(|n| *n > 0).unwrap_or(120).min(3600));
+            let background = req["background"].as_bool().unwrap_or(false);
+            let stream = sb.exec(tools::ExecReq::Run { command, timeout, background }).await.map_err(|e| e.to_string())?;
+            let (out, done) = stream.collect().await;
+            Ok(json!({"code": done.code, "timed_out": done.timed_out, "output": out}))
+        }
         "cancel" => { d.find(app, str_of(req, "instance")?)?.cancel.cancel(); Ok(json!({})) }
         "close" => {
             let n = str_of(req, "instance")?.to_string();
@@ -408,6 +446,8 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
                 let sw = i.swarm.lock().unwrap().clone();
                 json!({"instance": i.name, "cwd": i.p.cwd, "group": i.p.group, "running": i.running.load(Ordering::SeqCst), "crashed": i.crashed.load(Ordering::SeqCst),
                     "built": i.agent.lock().unwrap().is_some() || i.running.load(Ordering::SeqCst), "events": i.buf.lock().unwrap().seq,
+                    "pid": i.sandbox.lock().unwrap().as_ref().and_then(|s| s.init_pid()),
+                    "ports": i.sandbox.lock().unwrap().as_ref().map(|s| s.ports().iter().map(|(g, h)| json!({"guest": g, "host": h})).collect::<Vec<_>>()).unwrap_or_default(),
                     "agents": sw.map(|s| s.list()).unwrap_or_default()})
             }).collect();
             Ok(json!({"instances": items}))

@@ -191,14 +191,19 @@ impl Swarm {
     }
 
     /// Drop a root (its instance was closed) and everything it spawned.
-    pub async fn remove_root(&self, name: &str) {
-        type Item = (Option<tokio::task::JoinHandle<()>>, Arc<dyn Sandbox>);
+    /// Remove a root agent and the workers it spawned. `close_own` = false leaves the root's own sandbox open (it is shared with
+    /// the instance it was created from); its workers' sandboxes are always closed.
+    pub async fn remove_root(&self, name: &str, close_own: bool) {
+        type Item = (Option<tokio::task::JoinHandle<()>>, Arc<dyn Sandbox>, bool);
         let items: Vec<Item> = {
             let mut st = self.st.lock().unwrap();
             let names: Vec<String> = st.agents.iter().filter(|(k, a)| *k == name || a.parent.as_deref() == Some(name)).map(|(k, _)| k.clone()).collect();
-            names.iter().filter_map(|n| st.agents.remove(n)).map(|mut a| (a.handle.take(), a.sandbox)).filter(|_| true).collect()
+            names.iter().filter_map(|n| st.agents.remove(n).map(|mut a| (a.handle.take(), a.sandbox, n == name))).collect()
         };
-        for (h, sb) in items { if let Some(h) = h { h.abort(); } sb.close().await; }
+        for (h, sb, is_root) in items {
+            if let Some(h) = h { h.abort(); }
+            if close_own || !is_root { sb.close().await; }
+        }
         self.notify.notify_waiters();
     }
 

@@ -160,6 +160,8 @@ pub trait Sandbox: Send + Sync {
     fn ready(&self) -> BoxFut<'_, Result<()>> { Box::pin(async { Ok(()) }) }
     /// forwarded ports (guest, host)
     fn ports(&self) -> Vec<(u16, u16)> { vec![] }
+    /// host pid of the container's init process (tier 2, once it runs)
+    fn init_pid(&self) -> Option<u32> { None }
     /// (host dir, path the sandbox sees) where oversized tool output may be spilled
     fn spill_dir(&self) -> Option<(PathBuf, String)> { None }
 }

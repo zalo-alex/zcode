@@ -276,6 +276,8 @@ struct Procs {
     sup: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
     pasta: Option<tokio::process::Child>,
+    /// host pid of the container's init (for `nsenter`: terminals, debugging)
+    pid: Option<i64>,
 }
 
 pub struct ContainerSandbox {
@@ -385,7 +387,9 @@ async fn setup(cfg: ContainerCfg, probe: probe::Probe, policy: Policy, opts: Con
     let meta = |pasta: i64| json!({"id": id, "supervisor_pid": sup_pid, "pasta_pid": pasta, "run": run_id});
     let _ = std::fs::write(state.join("meta.json"), meta(0).to_string());
     match first {
-        Ok(Ok(Some(l))) if l.trim() == "ready" => {}
+        Ok(Ok(Some(l))) if l.trim() == "ready" => {
+            if let Ok(pid) = container_pid(&probe.runtime, &runtime_args, &root_dir, &id).await { procs.lock().await.pid = Some(pid); }
+        }
         Ok(Ok(Some(l))) => return Err(l.trim().trim_start_matches("error: ").to_string()),
         Ok(Ok(None)) => return Err("the namespace supervisor exited unexpectedly".into()),
         Ok(Err(e)) => return Err(e.to_string()),
@@ -552,6 +556,7 @@ impl Sandbox for ContainerSandbox {
     fn tier(&self) -> Tier { Tier::Container }
     fn ready(&self) -> BoxFut<'_, Result<()>> { Box::pin(async move { self.shared.conn().await.map(|_| ()).map_err(|e| anyhow!("{e}")) }) }
     fn ports(&self) -> Vec<(u16, u16)> { self.ports.lock().unwrap().clone() }
+    fn init_pid(&self) -> Option<u32> { self.procs.try_lock().ok().and_then(|p| p.pid).map(|p| p as u32) }
     fn spill_dir(&self) -> Option<(PathBuf, String)> { Some((self.spill.clone(), "/run/zcode/spill".into())) }
 }
 

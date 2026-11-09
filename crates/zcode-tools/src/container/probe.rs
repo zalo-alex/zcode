@@ -18,15 +18,28 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 /// A cgroup v2 directory we may create children in (delegation), if any.
+///
+/// The kernel refuses to enable domain controllers (`memory`) for children while the cgroup itself holds processes ("no internal
+/// processes"). When a needed controller is not enabled yet we therefore move this process into a leaf child (`zcode-main`) first
+/// and then enable the controllers; containers are created as siblings of that leaf.
 pub fn delegated_cgroup() -> Option<PathBuf> {
     let s = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = s.lines().find_map(|l| l.strip_prefix("0::"))?.trim().trim_start_matches('/').to_string();
     let dir = Path::new("/sys/fs/cgroup").join(&rel);
     let ctl = std::fs::read_to_string(dir.join("cgroup.controllers")).ok()?;
     let need = ["memory", "pids", "cpu"];
-    let sc = std::ffi::CString::new(dir.join("cgroup.subtree_control").to_str()?).ok()?;
-    let writable = unsafe { libc::access(sc.as_ptr(), libc::W_OK) == 0 };
-    (writable && need.iter().all(|c| ctl.split_whitespace().any(|x| x == *c))).then_some(dir)
+    if !need.iter().all(|c| ctl.split_whitespace().any(|x| x == *c)) { return None; }
+    let sc_path = dir.join("cgroup.subtree_control");
+    let sc = std::ffi::CString::new(sc_path.to_str()?).ok()?;
+    if unsafe { libc::access(sc.as_ptr(), libc::W_OK) } != 0 { return None; }
+    let enabled = |p: &Path| std::fs::read_to_string(p).map(|t| need.iter().all(|c| t.split_whitespace().any(|x| x == *c))).unwrap_or(false);
+    if enabled(&sc_path) { return Some(dir); }
+    // a leaf for ourselves, then the controllers for the siblings (best effort: any failure means "no delegation")
+    let leaf = dir.join("zcode-main");
+    std::fs::create_dir_all(&leaf).ok()?;
+    std::fs::write(leaf.join("cgroup.procs"), std::process::id().to_string()).ok()?;
+    for c in need { let _ = std::fs::write(&sc_path, format!("+{c}")); }
+    enabled(&sc_path).then_some(dir)
 }
 
 pub fn check(cfg: &ContainerCfg) -> Result<Probe, String> {

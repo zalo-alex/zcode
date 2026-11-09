@@ -299,3 +299,37 @@ fn an_instance_created_with_close_on_disconnect_ends_with_its_connection() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+#[test]
+fn exec_runs_a_command_in_the_instances_sandbox_and_returns_its_output() {
+    let e = Env::new("d_exec");
+    let llm = FakeLlm::start_fn(|_| text("unused"));
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "x1", &e.cwd, &llm, json!({}));
+    let r = c.ok("exec", json!({"instance": "x1", "command": "echo hello; exit 3"}));
+    assert_eq!(r["code"], 3, "{r}");
+    assert!(r["output"].as_str().unwrap().contains("hello"), "{r}");
+    assert_eq!(llm.count(), 0, "exec never calls the model");
+    assert_eq!(c.call("exec", json!({"instance": "nope", "command": "true"}))["ok"], false);
+    assert_eq!(c.call("exec", json!({"instance": "x1"}))["ok"], false);
+}
+
+#[test]
+fn an_instance_can_share_another_instances_sandbox() {
+    let e = Env::new("d_shared");
+    let llm = FakeLlm::start_fn(|_| text("unused"));
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "base", &e.cwd, &llm, json!({"group": "g"}));
+    create(&mut c, "guest", &e.cwd, &llm, json!({"sandbox_of": "base", "group": "g"}));
+    c.ok("build", json!({"instance": "base"}));
+    c.ok("build", json!({"instance": "guest"}));
+    c.ok("exec", json!({"instance": "base", "command": "cd /usr"}));
+    let r = c.ok("exec", json!({"instance": "guest", "command": "pwd"}));
+    assert!(r["output"].as_str().unwrap().contains("/usr"), "{r}");
+    c.ok("close", json!({"instance": "guest"}));
+    let r = c.ok("exec", json!({"instance": "base", "command": "echo still-open"}));
+    assert!(r["output"].as_str().unwrap().contains("still-open"), "{r}");
+    assert_eq!(c.call("create", json!({"instance": "x", "cwd": e.cwd, "config": {}, "sandbox_of": "nope"}))["ok"], false);
+}
