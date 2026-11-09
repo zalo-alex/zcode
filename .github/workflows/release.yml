@@ -1,5 +1,5 @@
 name: release
-# Tag a version (git tag v0.2.0 && git push --tags) to publish binaries for the install script.
+# Tag a version (git tag v0.3.0 && git push --tags) to publish binaries for the install script.
 # Built inside rust:bookworm so the binaries only need glibc 2.36 (Debian 12 and newer).
 on:
   push:
@@ -25,6 +25,7 @@ jobs:
           ZCODE_DEFAULT_REPO: ${{ github.repository }}
         run: |
           export ZCODE_COMMIT=$(echo "$ZCODE_COMMIT" | cut -c1-7)
+          rustup target add $(uname -m)-unknown-linux-musl
           cargo build --release --locked
           mkdir dist && cp target/release/zcode dist/
           tar -C dist -czf zcode-linux-${{ matrix.arch }}.tar.gz zcode

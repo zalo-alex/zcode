@@ -1,0 +1,31 @@
+[package]
+name = "zcode-tools"
+version = "0.3.0"
+edition = "2024"
+description = "zcode tool implementations and the Sandbox abstraction"
+license = "MIT"
+
+[features]
+default = ["web", "tier1", "host"]
+web = ["dep:reqwest"]
+# in-process `zcode image pull` / `image gc` (registry v2 client)
+oci = ["dep:reqwest", "dep:sha2", "dep:flate2"]
+tier1 = ["dep:seccompiler"]
+# host-side container backend (supervisor, OCI config, images); the guest does not need it
+host = []
+
+[dependencies]
+anyhow = "1.0.104"
+globset = "0.4.21"
+ignore = "0.4.34"
+libc = "0.2"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json"], optional = true }
+serde_json = "1.0.154"
+similar = "3.2.1"
+sha2 = { version = "0.10", optional = true }
+flate2 = { version = "1", optional = true }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "signal", "fs", "sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = { version = "0.5", optional = true }

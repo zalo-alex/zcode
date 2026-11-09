@@ -20,6 +20,7 @@ impl Perms {
 
     /// Ok(()) = allowed; Err(msg) = denied (fed back to model).
     pub fn check(&mut self, name: &str, args: &Value, cwd: &std::path::Path) -> Result<(), String> {
+        if matches!(name, "send" | "wait") { return Ok(()); }
         if name == "bash" {
             let c = args["command"].as_str().unwrap_or("");
             if DENY.iter().any(|d| c.contains(d)) { return Err("command blocked by safety deny-list".into()); }
@@ -32,7 +33,7 @@ impl Perms {
             if !self.confirm("⚠ untrusted content contained instructions; allow", name, args) { return Err("user denied this action".into()); }
             return Ok(());
         }
-        if matches!(name, "write" | "edit") && !self.allow_outside {
+        if matches!(name, "write" | "edit" | "multiedit") && !self.allow_outside {
             let p = args["path"].as_str().unwrap_or("");
             let abs = if std::path::Path::new(p).is_absolute() { p.into() } else { cwd.join(p) };
             if !crate::guard::inside(cwd, &abs) {
@@ -54,6 +55,7 @@ impl Perms {
     fn ask(&mut self, label: &str, name: &str, args: &Value) -> char {
         let summary = match name {
             "bash" => args["command"].as_str().unwrap_or("").to_string(),
+            "spawn" => format!("{} {}", args["name"].as_str().unwrap_or(""), args["prompt"].as_str().unwrap_or("")),
             _ => args["path"].as_str().unwrap_or("").to_string(),
         };
         eprint!("\x1b[33m? {label} {name}: {}\x1b[0m [y/N/a(lways)] ", summary.lines().next().unwrap_or(""));

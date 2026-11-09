@@ -21,6 +21,8 @@ pub struct Settings {
     pub auto: bool,
     /// config `thinking` (show the model's reasoning); None = unset
     pub thinking: Option<bool>,
+    /// merged config (for sandbox/profile keys)
+    pub raw: Value,
 }
 
 fn home() -> PathBuf {
@@ -60,7 +62,12 @@ pub fn layers() -> Value {
     m
 }
 
-fn resolve(cfg: &Value, model_ref: &str) -> Result<Config> {
+#[cfg(test)]
+fn resolve(cfg: &Value, model_ref: &str) -> Result<Config> { resolve_with(cfg, model_ref, true) }
+
+/// `use_env`: honor ZCODE_BASE_URL / ZCODE_API_KEY (false for configs supplied by a daemon client).
+fn resolve_with(cfg: &Value, model_ref: &str, use_env: bool) -> Result<Config> {
+    let env = |k: &str| if use_env { std::env::var(k).ok() } else { None };
     let providers = cfg.get("provider").and_then(|p| p.as_object());
     let names: Vec<&String> = providers.map(|p| p.keys().collect()).unwrap_or_default();
     let (prov_id, model_id) = match model_ref.split_once('/') {
@@ -72,11 +79,11 @@ fn resolve(cfg: &Value, model_ref: &str) -> Result<Config> {
     let opts = prov.get("options").unwrap_or(&Value::Null);
     let limit = prov.get("models").and_then(|m| m.get(&model_id)).and_then(|m| m.get("limit"));
     Ok(Config {
-        base_url: std::env::var("ZCODE_BASE_URL").ok()
+        base_url: env("ZCODE_BASE_URL")
             .or_else(|| opts.get("baseURL").and_then(|v| v.as_str()).map(String::from))
             .ok_or_else(|| anyhow!("provider `{prov_id}` has no options.baseURL"))?
             .trim_end_matches('/').to_string(),
-        api_key: std::env::var("ZCODE_API_KEY").ok()
+        api_key: env("ZCODE_API_KEY")
             .or_else(|| opts.get("apiKey").and_then(|v| v.as_str()).map(String::from))
             .unwrap_or_default(),
         model: model_id,
@@ -94,17 +101,22 @@ fn is_auto(cfg: &Value) -> bool {
 }
 
 impl Settings {
-    pub fn load(model_override: Option<&str>) -> Result<Settings> {
-        let cfg = layers();
+    pub fn load(model_override: Option<&str>) -> Result<Settings> { Self::from_cfg(layers(), model_override, true) }
+
+    /// Build settings from a config object that is not ours (a daemon client's): the process environment is never consulted.
+    pub fn from_client(cfg: Value, model_override: Option<&str>) -> Result<Settings> { Self::from_cfg(cfg, model_override, false) }
+
+    fn from_cfg(cfg: Value, model_override: Option<&str>, use_env: bool) -> Result<Settings> {
         let s = |k: &str| cfg.get(k).and_then(|v| v.as_str()).map(String::from);
+        let env = |k: &str| if use_env { std::env::var(k).ok() } else { None };
         let model_ref = model_override.map(String::from)
-            .or_else(|| std::env::var("ZCODE_MODEL").ok())
-            .or_else(|| std::env::var("OPENCODE_MODEL").ok())
+            .or_else(|| env("ZCODE_MODEL"))
+            .or_else(|| env("OPENCODE_MODEL"))
             .or_else(|| s("model"))
             .ok_or_else(|| anyhow!("no model configured: set `model` in config, --model provider/model, or ZCODE_MODEL"))?;
-        let main = resolve(&cfg, &model_ref)?;
-        let small = s("small_model").filter(|m| *m != model_ref).and_then(|m| resolve(&cfg, &m).ok());
-        Ok(Settings { main, small, auto: is_auto(&cfg), thinking: cfg.get("thinking").and_then(|v| v.as_bool()) })
+        let main = resolve_with(&cfg, &model_ref, use_env)?;
+        let small = s("small_model").filter(|m| *m != model_ref).and_then(|m| resolve_with(&cfg, &m, use_env).ok());
+        Ok(Settings { main, small, auto: is_auto(&cfg), thinking: cfg.get("thinking").and_then(|v| v.as_bool()), raw: cfg })
     }
 }
 

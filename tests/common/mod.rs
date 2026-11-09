@@ -72,7 +72,9 @@ fn respond(mut sock: TcpStream, script: Script) {
     let _ = sock.flush();
 }
 
-fn handle(mut sock: TcpStream, reqs: Arc<Mutex<Vec<Value>>>, queue: Arc<Mutex<VecDeque<Script>>>, default: Option<Script>) {
+pub type Router = Arc<dyn Fn(&Value) -> Script + Send + Sync>;
+
+fn handle(mut sock: TcpStream, reqs: Arc<Mutex<Vec<Value>>>, queue: Arc<Mutex<VecDeque<Script>>>, default: Option<Script>, router: Option<Router>) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     let header_end = loop {
@@ -89,8 +91,11 @@ fn handle(mut sock: TcpStream, reqs: Arc<Mutex<Vec<Value>>>, queue: Arc<Mutex<Ve
         buf.extend_from_slice(&tmp[..n]);
     }
     let body: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
+    let script = match &router {
+        Some(f) => f(&body),
+        None => queue.lock().unwrap().pop_front().or(default).unwrap_or(Script::Text("(no script left)".into())),
+    };
     reqs.lock().unwrap().push(body);
-    let script = queue.lock().unwrap().pop_front().or(default).unwrap_or(Script::Text("(no script left)".into()));
     respond(sock, script);
 }
 
@@ -98,7 +103,14 @@ impl FakeLlm {
     pub fn start(scripts: Vec<Script>) -> FakeLlm { Self::start_with_default(scripts, None) }
 
     /// After `scripts` run out, `default` is repeated forever.
-    pub fn start_with_default(scripts: Vec<Script>, default: Option<Script>) -> FakeLlm {
+    /// Route by request content: lets several concurrent agents get deterministic replies.
+    pub fn start_fn(f: impl Fn(&Value) -> Script + Send + Sync + 'static) -> FakeLlm {
+        Self::start_inner(vec![], None, Some(Arc::new(f)))
+    }
+
+    pub fn start_with_default(scripts: Vec<Script>, default: Option<Script>) -> FakeLlm { Self::start_inner(scripts, default, None) }
+
+    fn start_inner(scripts: Vec<Script>, default: Option<Script>, router: Option<Router>) -> FakeLlm {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/v1", l.local_addr().unwrap().port());
         let reqs = Arc::new(Mutex::new(vec![]));
@@ -106,8 +118,8 @@ impl FakeLlm {
         let (r, q) = (reqs.clone(), queue.clone());
         std::thread::spawn(move || {
             for s in l.incoming().flatten() {
-                let (r, q, d) = (r.clone(), q.clone(), default.clone());
-                std::thread::spawn(move || handle(s, r, q, d));
+                let (r, q, d, f) = (r.clone(), q.clone(), default.clone(), router.clone());
+                std::thread::spawn(move || handle(s, r, q, d, f));
             }
         });
         FakeLlm { url, requests: reqs }

@@ -17,7 +17,7 @@ One 8 MB binary. 2 ms startup. ~30 MB of RAM. Any OpenAI-compatible model.
 
 ```text
 $ zcode
-zcode 0.2.0 · deepseek-v4-1-flash-free · ~/projects/api
+zcode 0.3.0 · deepseek-v4-1-flash-free · ~/projects/api
 session ses_6aece2ed815bce · auto-approve
 
 › the login test fails, fix it
@@ -141,6 +141,10 @@ Any OpenAI-compatible `/chat/completions` endpoint with streaming and tool calls
 
 - **Permissions:** `write`, `edit` and `bash` ask `y / N / always`. `--auto` skips prompts. Obvious disasters (`rm -rf /`, `mkfs`, …) are always blocked.
 - **Confinement:** writes outside the working directory need `--auto` or `--allow-outside`.
+- **Sandbox (tier 1, default):** the bash child runs under Landlock + seccomp: it only sees the project, system dirs and toolchains read-only, a private tmp, no `$HOME` secrets, no network unless `--net`, no `ptrace`/`mount`. File tools are path-checked with `openat2(RESOLVE_BENEATH)`. `--sandbox none` opts out; unsupported kernels fail closed (see `docs/PROTOCOL.md`).
+- **Daemon (opt-in, `zcode serve`):** one resident process hosting many instances on a shared bus and model-connection pool; clients (including `zcode run --auto`) create, attach and detach by id. See `docs/DAEMON.md`.
+- **Tier 2 (opt-in, `--sandbox container`):** one rootless crun container per agent with its own root filesystem, namespaces and network (`pasta` or `slirp4netns`); only the project dir is shared (read-only unless assigned). Images: `zcode image import`, or `zcode image pull alpine` (build with `--features oci` for the in-process registry client). See `docs/TIER2.md`.
+- **Swarm (opt-in, `--max-workers N`):** the lead can `spawn` workers that run in the same process, each with its own sandbox, history and write paths, and coordinate through `send` / `wait`. Budgets cover the whole swarm.
 - **Injection guard:** instruction-like text in files, web pages or command output (“ignore the user…”) is tagged as untrusted data, and mutating tools are denied for the rest of that turn. Tune with `--guard ask|deny|warn|off`.
 - **Runaway protection:** identical-call detection, an exploration-loop breaker, and limits on time, steps and tokens (`--max-time`, `--max-steps`, `--max-tokens`). Hitting a limit exits with code `3`.
 

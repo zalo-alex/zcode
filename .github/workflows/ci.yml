@@ -11,6 +11,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: sudo apt-get update && sudo apt-get install -y crun busybox-static passt slirp4netns fuse-overlayfs musl-tools
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked --features oci -- -D warnings
+      - run: cargo test -p zcode-tools --locked --features oci

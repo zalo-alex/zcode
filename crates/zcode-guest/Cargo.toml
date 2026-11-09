@@ -1,0 +1,12 @@
+[package]
+name = "zcode-guest"
+version = "0.3.0"
+edition = "2024"
+description = "zcode tier 2 guest: container init + tool server (static musl)"
+license = "MIT"
+
+[dependencies]
+zcode-tools = { path = "../zcode-tools", default-features = false }
+libc = "0.2"
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }

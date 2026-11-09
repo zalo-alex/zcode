@@ -1,30 +1,57 @@
-mod bash;
-mod edit;
-mod fs;
-mod search;
+#![cfg_attr(not(feature = "tier1"), allow(dead_code))]
+//! zcode tools: schemas, dispatch, and the `Sandbox` abstraction they run through.
+mod edit_impl;
+mod fsops;
+mod local;
+#[cfg(target_os = "linux")]
+mod pathguard;
+#[cfg(not(target_os = "linux"))]
+mod pathguard {
+    //! Non-Linux stub: the userland path policy needs openat2.
+    use std::{fs::File, io, path::{Path, PathBuf}};
+    pub struct PathGuard;
+    fn no<T>() -> io::Result<T> { Err(io::Error::new(io::ErrorKind::Unsupported, "sandbox path policy requires Linux")) }
+    impl PathGuard {
+        pub fn open_read(&self, _: &Path) -> io::Result<File> { no() }
+        pub fn open_write(&self, _: &Path) -> io::Result<File> { no() }
+        pub fn open_dir(&self, _: &Path) -> io::Result<()> { no() }
+        pub fn list_dir(&self, _: &Path) -> io::Result<Vec<(String, bool)>> { no() }
+        pub fn mkdir_p(&self, _: &Path) -> io::Result<()> { no() }
+        pub fn canon_of(&self, _: &File) -> Option<PathBuf> { None }
+    }
+}
+pub mod frames;
+pub mod sandbox;
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub mod container;
+#[cfg(all(target_os = "linux", feature = "tier1"))]
+mod tier1;
+#[cfg(feature = "web")]
 mod web;
 
-use anyhow::{Result, anyhow};
+pub use fsops::STALE;
+pub use local::cache_dir;
+pub use local::LocalSandbox;
+pub use sandbox::*;
+
+use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub struct Ctx {
-    pub cwd: Mutex<PathBuf>,
-    pub read_files: Mutex<HashSet<PathBuf>>,
+    pub sandbox: Arc<dyn Sandbox>,
+    /// `webfetch` is host-side; gated by the agent's net policy
+    pub net: bool,
     pub todos: Mutex<Vec<(String, String)>>, // (status, content)
 }
 
 impl Ctx {
-    pub fn new(cwd: PathBuf) -> Self {
-        Ctx { cwd: Mutex::new(cwd), read_files: Default::default(), todos: Default::default() }
-    }
-    pub fn cwd(&self) -> PathBuf { self.cwd.lock().unwrap().clone() }
-    pub fn resolve(&self, p: &str) -> PathBuf {
-        let pb = Path::new(p);
-        if pb.is_absolute() { pb.to_path_buf() } else { self.cwd().join(pb) }
-    }
+    /// Tier 0 context (no isolation).
+    pub fn new(cwd: PathBuf) -> Self { Self::with_sandbox(Arc::new(LocalSandbox::open_none(Policy::new(cwd))), true) }
+    pub fn with_sandbox(sandbox: Arc<dyn Sandbox>, net: bool) -> Self { Ctx { sandbox, net, todos: Default::default() } }
+    pub fn cwd(&self) -> PathBuf { self.sandbox.cwd() }
 }
 
 pub struct Spec {
@@ -111,34 +138,76 @@ fn floor(s: &str, mut i: usize) -> usize { while !s.is_char_boundary(i) { i -= 1
 fn ceil(s: &str, mut i: usize) -> usize { while !s.is_char_boundary(i) { i += 1; } i }
 
 pub async fn run(name: &str, args: &Value, ctx: &Ctx) -> Result<String> {
+    let fs = ctx.sandbox.fs();
     let out = match name {
-        "read" => fs::read(args, ctx).await?,
-        "ls" => fs::ls(args, ctx)?,
-        "write" => fs::write(args, ctx).await?,
-        "edit" => edit::edit(args, ctx).await?,
-        "glob" => search::glob(args, ctx)?,
-        "grep" => search::grep(args, ctx)?,
-        "bash" => bash::bash(args, ctx).await?,
-        "bash_output" => bash::output(args)?,
-        "bash_kill" => bash::kill_job(args).await?,
-        "multiedit" => edit::multiedit(args, ctx).await?,
-        "todoread" => fs::todo_read(ctx),
-        "webfetch" => web::fetch(args).await?,
-        "todowrite" => fs::todo(args, ctx)?,
+        "read" => fs.read(args).await?,
+        "ls" => fs.ls(args).await?,
+        "write" => fs.write(args).await?,
+        "edit" => fs.edit(args).await?,
+        "glob" => fs.glob(args).await?,
+        "grep" => fs.grep(args).await?,
+        "multiedit" => fs.multiedit(args).await?,
+        "bash" => bash(args, ctx).await?,
+        "bash_output" => {
+            let lines = args["lines"].as_u64().unwrap_or(100) as usize;
+            ctx.sandbox.exec(ExecReq::JobOutput { id: args["id"].as_str().map(String::from), lines }).await?.collect().await.0
+        }
+        "bash_kill" => ctx.sandbox.exec(ExecReq::JobKill { id: s(args, "id")?.to_string() }).await?.collect().await.0,
+        "todoread" => todo_read(ctx),
+        "todowrite" => todo(args, ctx)?,
+        "webfetch" => {
+            if !ctx.net { bail!("network is disabled by the sandbox policy (start zcode with --net)"); }
+            #[cfg(feature = "web")]
+            { web::fetch(args).await? }
+            #[cfg(not(feature = "web"))]
+            { bail!("webfetch is not built in") }
+        }
         "task" => return Err(anyhow!("task handled by agent")),
         _ => return Err(anyhow!("unknown tool `{name}`")),
     };
-    Ok(cap_spill(out, 30_000))
+    Ok(cap_spill(out, 30_000, ctx))
+}
+
+async fn bash(a: &Value, ctx: &Ctx) -> Result<String> {
+    let command = s(a, "command")?.to_string();
+    let background = a["background"].as_bool().unwrap_or(false);
+    let secs = a["timeout"].as_u64().unwrap_or_else(local::default_timeout_secs).clamp(1, 3600);
+    let (mut text, done) = ctx.sandbox.exec(ExecReq::Run { command, timeout: Duration::from_secs(secs), background }).await?.collect().await;
+    if background { return Ok(text); }
+    if done.timed_out {
+        text.push_str(&format!("\n[timeout after {secs}s, killed. For long-running or never-ending commands use background: true]"));
+    } else if let Some(c) = done.code && c != 0 {
+        text.push_str(&format!("\n[exit {c}]"));
+    }
+    Ok(if text.trim().is_empty() { "(no output)".into() } else { text })
+}
+
+fn todo_read(ctx: &Ctx) -> String {
+    let t = ctx.todos.lock().unwrap();
+    if t.is_empty() { return "(no todos)".into(); }
+    t.iter().map(|(s, c)| format!("[{}] {}", match s.as_str() { "completed" => "x", "in_progress" => "~", _ => " " }, c)).collect::<Vec<_>>().join("\n")
+}
+
+fn todo(a: &Value, ctx: &Ctx) -> Result<String> {
+    let items = a["todos"].as_array().ok_or_else(|| anyhow!("todos must be array"))?;
+    let v: Vec<(String, String)> = items.iter()
+        .map(|t| (t["status"].as_str().unwrap_or("pending").into(), t["content"].as_str().unwrap_or("").into()))
+        .collect();
+    let out = v.iter().map(|(s, c)| format!("[{}] {}", match s.as_str() { "completed" => "x", "in_progress" => "~", _ => " " }, c)).collect::<Vec<_>>().join("\n");
+    *ctx.todos.lock().unwrap() = v;
+    Ok(out)
 }
 
 /// Like `cap`, but when output is cut the full text is saved to a file whose path is appended.
-fn cap_spill(out: String, max: usize) -> String {
+fn cap_spill(out: String, max: usize, ctx: &Ctx) -> String {
     if out.len() <= max { return out; }
-    let dir = bash::cache_dir().join("tool-output");
+    // tier 2: spill where the sandbox can read it back; otherwise the host cache dir
+    let (dir, shown) = match ctx.sandbox.spill_dir() { Some((h, g)) => (h, Some(g)), None => (local::cache_dir().join("tool-output"), None) };
     let path = dir.join(format!("{}-{}.txt", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
     let saved = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &out)).is_ok();
     let mut c = cap(out, max);
-    if saved { c.push_str(&format!("\n[full output saved to {}; use read with offset/limit or grep]", path.display())); }
+    let shown_path = match (&shown, path.file_name()) { (Some(g), Some(n)) => format!("{g}/{}", n.to_string_lossy()), _ => path.display().to_string() };
+    if saved { c.push_str(&format!("\n[full output saved to {shown_path}; use read with offset/limit or grep]")); }
     c
 }
 

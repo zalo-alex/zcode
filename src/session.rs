@@ -63,6 +63,17 @@ impl Session {
         Ok(Session { id, path, header })
     }
 
+
+    /// Per-agent session `<base>.<agent>` for swarm workers (the `.` keeps it out of user-supplied ids).
+    pub fn open_worker(base: &str, agent: &str, cwd: &Path, model: &str) -> Result<Session> {
+        if !valid_id(agent) || agent.len() > 32 { bail!("invalid agent name `{agent}`"); }
+        let id = format!("{base}.{agent}");
+        std::fs::create_dir_all(dir())?;
+        let path = dir().join(format!("{id}.jsonl"));
+        let header = header_of(&id, cwd, model);
+        if !path.exists() { std::fs::write(&path, format!("{header}\n"))?; }
+        Ok(Session { id, path, header })
+    }
     pub fn load(&self) -> Vec<Message> {
         std::fs::read_to_string(&self.path).unwrap_or_default().lines()
             .filter(|l| !l.contains("\"zcode_session\""))
@@ -113,7 +124,7 @@ pub fn list() -> Vec<Info> {
 /// Most recently updated session whose working directory is `cwd`.
 pub fn latest_for_cwd(cwd: &Path) -> Option<String> {
     let want = cwd.display().to_string();
-    list().into_iter().find(|i| i.cwd == want && i.messages > 0).map(|i| i.id)
+    list().into_iter().find(|i| i.cwd == want && i.messages > 0 && !i.id.contains('.')).map(|i| i.id)
 }
 
 #[cfg(test)]

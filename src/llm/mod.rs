@@ -106,9 +106,9 @@ impl Client {
     pub async fn chat(&self, msgs: &[Message], tools: &[Value], mut on_delta: impl FnMut(Delta)) -> Result<Reply> {
         let mut tries = 0u32;
         loop {
-            let emitted = std::cell::Cell::new(false);
+            let emitted = std::sync::atomic::AtomicBool::new(false);
             let res = {
-                let mut wrapped = |d: Delta| { if matches!(d, Delta::Text(_)) { emitted.set(true); } on_delta(d) };
+                let mut wrapped = |d: Delta| { if matches!(d, Delta::Text(_)) { emitted.store(true, std::sync::atomic::Ordering::Relaxed); } on_delta(d) };
                 self.chat_once(msgs, tools, &mut wrapped).await
             };
             let retry_reason = match res {
@@ -122,7 +122,7 @@ impl Client {
                         Some(_) => true,
                         None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request() || r.is_body()),
                     };
-                    if !retryable || emitted.get() || tries >= 4 { return Err(e); }
+                    if !retryable || emitted.load(std::sync::atomic::Ordering::Relaxed) || tries >= 4 { return Err(e); }
                     e.to_string()
                 }
             };

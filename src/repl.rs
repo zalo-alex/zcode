@@ -3,7 +3,7 @@ use crate::{context, session};
 use crate::style::Paint;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-const HELP: &str = "/help  /clear  /compact  /thinking  /sessions  /status  /todo  /cost  /model  /exit   (Ctrl-C interrupts a turn)";
+const HELP: &str = "/help  /clear  /compact  /thinking  /sessions  /status  /todo  /cost  /agents  /model  /exit   (Ctrl-C interrupts a turn)";
 
 fn last_assistant_tail(agent: &Agent) -> Option<String> {
     let m = agent.msgs.iter().rev().find(|m| m.role == "assistant" && m.content.as_ref().is_some_and(|c| !c.trim().is_empty()))?;
@@ -50,7 +50,18 @@ pub async fn run(mut agent: Agent, resumed: bool) -> anyhow::Result<()> {
                 "todo" => {
                     for (s, c) in agent.ctx.todos.lock().unwrap().iter() { println!("[{}] {c}", match s.as_str() { "completed" => "x", "in_progress" => "~", _ => " " }); }
                 }
-                "cost" => println!("tokens in {} / out {} · ctx ~{}/{}", agent.tokens_in, agent.tokens_out, context::estimate(&agent.msgs), agent.client.cfg.context),
+                "cost" => {
+                    println!("tokens in {} / out {} · ctx ~{}/{}", agent.tokens_in, agent.tokens_out, context::estimate(&agent.msgs), agent.client.cfg.context);
+                    if let Some(sw) = &agent.swarm {
+                        let t = sw.totals();
+                        for (n, i, o) in &t { println!("  {n}: in {i} / out {o}"); }
+                        println!("  swarm total: in {} / out {}", t.iter().map(|x| x.1).sum::<u64>(), t.iter().map(|x| x.2).sum::<u64>());
+                    }
+                }
+                "agents" => match &agent.swarm {
+                    Some(sw) => for l in sw.list() { println!("{l}"); },
+                    None => println!("swarm is off (start with --max-workers N)"),
+                },
                 "model" => println!("{}", agent.client.cfg.model),
                 _ => println!("unknown command; {HELP}"),
             }
@@ -62,5 +73,6 @@ pub async fn run(mut agent: Agent, resumed: bool) -> anyhow::Result<()> {
             Err(e) => eprintln!("{} {e}", "error:".red()),
         }
     }
+    if let Some(sw) = &agent.swarm { sw.shutdown().await; }
     Ok(())
 }

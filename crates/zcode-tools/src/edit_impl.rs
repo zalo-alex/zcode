@@ -1,6 +1,4 @@
-use super::{Ctx, s};
 use anyhow::{Result, bail};
-use serde_json::Value;
 use similar::TextDiff;
 
 fn indent_of(l: &str) -> &str { &l[..l.len() - l.trim_start().len()] }
@@ -42,40 +40,8 @@ pub fn apply_edit(text: &str, old: &str, new: &str, all: bool) -> Result<(String
     Ok((out.join("\n"), hits.len()))
 }
 
-async fn load(a: &Value, ctx: &Ctx) -> Result<(std::path::PathBuf, String)> {
-    let p = ctx.resolve(s(a, "path")?);
-    let c = p.canonicalize().map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
-    if !ctx.read_files.lock().unwrap().contains(&c) { bail!("read the file first"); }
-    let text = tokio::fs::read_to_string(&p).await?;
-    Ok((p, text))
-}
-
-fn diff(a: &str, b: &str) -> String {
+pub fn diff(a: &str, b: &str) -> String {
     TextDiff::from_lines(a, b).unified_diff().context_radius(2).to_string()
-}
-
-pub async fn edit(a: &Value, ctx: &Ctx) -> Result<String> {
-    let (old, new) = (s(a, "old_string")?, s(a, "new_string")?);
-    if old == new { bail!("old_string and new_string identical"); }
-    let (p, text) = load(a, ctx).await?;
-    let (updated, n) = apply_edit(&text, old, new, a["replace_all"].as_bool().unwrap_or(false))?;
-    tokio::fs::write(&p, &updated).await?;
-    Ok(format!("edited {} ({n} replacement{})\n{}", p.display(), if n == 1 { "" } else { "s" }, diff(&text, &updated)))
-}
-
-pub async fn multiedit(a: &Value, ctx: &Ctx) -> Result<String> {
-    let edits = a["edits"].as_array().ok_or_else(|| anyhow::anyhow!("edits must be an array"))?;
-    if edits.is_empty() { bail!("edits is empty"); }
-    let (p, text) = load(a, ctx).await?;
-    let mut cur = text.clone();
-    for (i, e) in edits.iter().enumerate() {
-        let (old, new) = (s(e, "old_string")?, s(e, "new_string")?);
-        let (next, _) = apply_edit(&cur, old, new, e["replace_all"].as_bool().unwrap_or(false))
-            .map_err(|err| anyhow::anyhow!("edit #{} failed (nothing written): {err}", i + 1))?;
-        cur = next;
-    }
-    tokio::fs::write(&p, &cur).await?;
-    Ok(format!("edited {} ({} edits)\n{}", p.display(), edits.len(), diff(&text, &cur)))
 }
 
 #[cfg(test)]
