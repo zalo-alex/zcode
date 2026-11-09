@@ -28,7 +28,7 @@ fn provider(c: &crate::config::Config) -> Value {
 }
 
 /// The client's own resolved configuration (its env and files already applied): the daemon never uses its own.
-fn client_config(s: &Settings) -> Value {
+pub fn client_config(s: &Settings) -> Value {
     let mut cfg = json!({"provider": {"main": provider(&s.main)}, "model": format!("main/{}", s.main.model)});
     if let Some(sm) = &s.small {
         cfg["provider"]["small"] = provider(sm);

@@ -148,16 +148,16 @@ impl Daemon {
             session_base: p.session.clone(), model: settings.main.model.clone(), lead_tier: sandbox.tier(), idmap_full: false, limits: p.limits.clone(), format: events::Format::Json };
         let g = |k: &str, d: u64| p.swarm.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
         let mut cfg = SwarmCfg { max_workers: p.max_workers, max_depth: g("max_depth", 1) as u32, pair_cap: g("pair_cap", 40) as u32, total_cap: g("total_cap", 400) as u32,
-            chain_cap: g("chain_cap", 16) as u32, concurrency: g("concurrency", 4) as usize, show_workers: false, json: true };
+            chain_cap: g("chain_cap", 16) as u32, concurrency: g("concurrency", 4) as usize, show_workers: false, json: true, unbounded: p.group.is_some() };
         let swarm = if let Some(gname) = &p.group {
             let key = Self::ns(&inst.app, gname);
             let existing = self.groups.lock().unwrap().get(&key).cloned();
             match existing {
-                Some(sw) => { let rx = sw.add_root(&inst.name, sc(), sandbox.clone())?; agent.join_swarm_as_lead(sw.clone(), rx); sw }
+                Some(sw) => { let rx = sw.add_root(&inst.name, sc(), sandbox.clone())?; agent.join_group(sw.clone(), rx, &inst.name, gname); sw }
                 None => {
                     cfg.max_workers = p.max_workers;
                     let (sw, rx) = Swarm::new(cfg, sc(), &inst.name, sandbox.clone());
-                    agent.join_swarm_as_lead(sw.clone(), rx);
+                    agent.join_group(sw.clone(), rx, &inst.name, gname);
                     self.groups.lock().unwrap().insert(key, sw.clone());
                     sw
                 }
@@ -274,6 +274,8 @@ async fn handle_conn(d: Arc<Daemon>, stream: UnixStream) {
     let mut app = "default".to_string();
     let mut authed = d.cfg.apps.is_empty();
     let mut attached: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // instances created with `close_on_disconnect` (an interactive terminal's agent) end with their connection
+    let mut owned: Vec<String> = vec![];
     while let Ok(req) = read_frame(&mut rd).await {
         let op = req["op"].as_str().unwrap_or("").to_string();
         if op == "hello" {
@@ -285,8 +287,10 @@ async fn handle_conn(d: Arc<Daemon>, stream: UnixStream) {
         }
         if !authed { reply(&tx, &req, Err("hello with app and token required".into())); continue; }
         let r = dispatch(&d, &app, &op, &req, &tx, &mut attached).await;
+        if op == "create" && r.is_ok() && req["close_on_disconnect"].as_bool() == Some(true) && let Some(n) = req["instance"].as_str() { owned.push(n.to_string()); }
         reply(&tx, &req, r);
     }
+    for n in owned { let _ = d.close_instance(&app, &n).await; }
     // a dead client never takes its instances down; only its event forwarders stop
     for (_, h) in attached { h.abort(); }
 }
@@ -360,8 +364,18 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             let text = str_of(req, "text")?.to_string();
             if text.trim().is_empty() { return Err("empty prompt".into()); }
             d.ensure_built(&inst).await?;
+            // a person typed: re-arm the agent-to-agent message caps and the reply-chain counter
+            if let Some(sw) = inst.swarm.lock().unwrap().clone() { sw.reset_caps(); }
+            if let Some(a) = inst.agent.lock().unwrap().as_mut() { a.last_hops = 0; }
             d.start_turn(&inst, text)?;
             Ok(json!({}))
+        }
+        "build" => {
+            // join the group (and start answering messages) now instead of at the first prompt
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            d.ensure_built(&inst).await?;
+            let agents = inst.swarm.lock().unwrap().clone().map(|s| s.list()).unwrap_or_default();
+            Ok(json!({"agents": agents}))
         }
         "send" => {
             let inst = d.find(app, str_of(req, "instance")?)?;

@@ -46,10 +46,12 @@ pub struct SwarmCfg {
     pub concurrency: usize,
     pub show_workers: bool,
     pub json: bool,
+    /// no step/token/time budget for the swarm as a whole (long-lived groups of people-driven agents; each turn keeps its own limits)
+    pub unbounded: bool,
 }
 impl Default for SwarmCfg {
     fn default() -> Self {
-        SwarmCfg { max_workers: 4, max_depth: 1, pair_cap: 40, total_cap: 400, chain_cap: 16, concurrency: 4, show_workers: false, json: false }
+        SwarmCfg { max_workers: 4, max_depth: 1, pair_cap: 40, total_cap: 400, chain_cap: 16, concurrency: 4, show_workers: false, json: false, unbounded: false }
     }
 }
 
@@ -172,7 +174,7 @@ impl Swarm {
             limits: sc.limits.clone(), format: sc.format });
         st.agents.insert(root.into(), Entry { ctx: sc_arc, tx, status: Status::Running, queued: 0, parent: None, tier: lead_sandbox.tier(), sandbox: lead_sandbox,
             handle: None, steps: 0, tin: 0, tout: 0, write: vec![] });
-        let sw = Swarm { st: Mutex::new(st), sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))), budget: Budget::new(&sc.limits), cfg, notify: Notify::new(),
+        let sw = Swarm { st: Mutex::new(st), sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))), budget: Budget::new(&if cfg.unbounded { Limits { max_time: None, max_steps: usize::MAX / 2, max_tokens: u64::MAX / 2 } } else { sc.limits.clone() }), cfg, notify: Notify::new(),
             next_id: AtomicU64::new(1), sc, print: Mutex::new(()) };
         (Arc::new(sw), rx)
     }
@@ -224,6 +226,13 @@ impl Swarm {
         st.in_flight = st.in_flight.saturating_sub(n);
         drop(st);
         self.notify.notify_waiters();
+    }
+
+    /// A person acted: re-arm the message caps (they exist to stop agents answering each other forever).
+    pub fn reset_caps(&self) {
+        let mut st = self.st.lock().unwrap();
+        st.pair.clear();
+        st.total = 0;
     }
 
     pub fn report(&self, name: &str, tin: u64, tout: u64) {

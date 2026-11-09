@@ -244,3 +244,58 @@ fn a_panic_in_one_instance_does_not_take_down_the_daemon() {
     c.ok("prompt", json!({"instance": "good", "text": "hello"}));
     assert_eq!(c.wait("good turn_end", turn_end("good"))["text"], "fine");
 }
+
+#[test]
+fn a_group_builds_on_demand_keeps_going_past_the_swarm_budget_and_a_person_re_arms_the_message_caps() {
+    let e = Env::new("d_peer_caps");
+    let llm = FakeLlm::start_fn(|_| text("ok"));
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    // tiny per-turn limits and a pair cap of 2: a group is long-lived, so only the per-turn limits and the cap on agent chatter apply
+    create(&mut c, "a", &e.cwd, &llm, json!({"group": "g", "limits": {"max_steps": 2}, "swarm": {"pair_cap": 2}}));
+    c.ok("attach", json!({"instance": "a"}));
+    // `build` joins the group now (nothing was built at create) and lists who is in it
+    let b = c.ok("build", json!({"instance": "a"}));
+    assert!(b["agents"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().starts_with("a ")), "{b}");
+    // far more steps over time than max_steps (2): the swarm as a whole is not budgeted
+    for i in 0..4 {
+        c.ok("prompt", json!({"instance": "a", "text": format!("turn {i}")}));
+        let t = c.wait("turn end", turn_end("a"));
+        assert_eq!(t["code"], 0, "turn {i}: {t}");
+    }
+    // messages to it count against the pair cap (2) ...
+    for i in 0..2 {
+        c.ok("send", json!({"instance": "a", "to": "a", "text": format!("ping {i}")}));
+        c.wait("woken by the message", turn_end("a"));
+    }
+    let r = c.call("send", json!({"instance": "a", "to": "a", "text": "ping 2"}));
+    assert_eq!(r["ok"], false);
+    assert!(r["err"].as_str().unwrap().contains("hop limit"), "{r}");
+    // ... until a person types: then the agents may talk again
+    c.ok("prompt", json!({"instance": "a", "text": "I am here"}));
+    c.wait("turn end", turn_end("a"));
+    c.ok("send", json!({"instance": "a", "to": "a", "text": "ping 3"}));
+    c.wait("woken again", turn_end("a"));
+}
+
+#[test]
+fn an_instance_created_with_close_on_disconnect_ends_with_its_connection() {
+    let e = Env::new("d_ephemeral");
+    let llm = FakeLlm::start_fn(|_| text("ok"));
+    let d = start(&e, json!({}), &[]);
+    let mut watcher = Client::connect(&d);
+    {
+        let mut c = Client::connect(&d);
+        create(&mut c, "mine", &e.cwd, &llm, json!({"close_on_disconnect": true}));
+        create(&mut c, "kept", &e.cwd, &llm, json!({}));
+        assert_eq!(watcher.ok("status", json!({}))["instances"].as_array().unwrap().len(), 2);
+    }
+    let t = std::time::Instant::now();
+    loop {
+        let s = watcher.ok("status", json!({}));
+        let names: Vec<&str> = s["instances"].as_array().unwrap().iter().map(|i| i["instance"].as_str().unwrap()).collect();
+        if names == ["kept"] { break; }
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "only the flagged instance should end: {names:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

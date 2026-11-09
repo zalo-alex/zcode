@@ -5,6 +5,7 @@ mod context;
 mod events;
 mod guard;
 mod llm;
+mod peer;
 mod permission;
 mod prompt;
 mod repl;
@@ -145,6 +146,12 @@ struct Common {
     /// Show worker progress (one prefixed line per step, no interleaved streaming)
     #[arg(long, global = true)]
     show_workers: bool,
+    /// Interactive: join a group of agents through the daemon (`zcode serve`); agents in a group can message each other
+    #[arg(long, global = true)]
+    group: Option<String>,
+    /// Your agent's name in the group, so others can address it (default zcode-<pid>)
+    #[arg(long, global = true, requires = "group")]
+    agent: Option<String>,
 }
 
 fn install_signal_handlers() {
@@ -214,13 +221,18 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
     let guard = common.guard.unwrap_or(if auto || !std::io::stdin().is_terminal() { GuardMode::Deny } else { GuardMode::Ask });
     let thinking = if common.no_thinking { false } else if common.thinking { true } else { settings.thinking.unwrap_or(!is_run) };
     let model_name = settings.main.model.clone();
+    // `--group`: the interactive agent lives in the daemon, next to the other agents of its group
+    if let Some(group) = &common.group {
+        if is_run || prompt.is_some() { anyhow::bail!("--group is for the interactive mode: run `zcode --group NAME --auto` without a message"); }
+        if !auto { anyhow::bail!("--group runs your agent inside the daemon, which cannot ask for permission: add --auto (commands still run in the sandbox)"); }
+        let (sandbox, policy, max_workers) = daemon_request(&common, &settings, &cwd, auto)?;
+        let name = common.agent.clone().unwrap_or_else(|| format!("zcode-{}", std::process::id()));
+        return peer::run(peer::Join { settings: &settings, cwd: &cwd, group: group.clone(), name, sandbox, require_sandbox: common.require_sandbox, policy, max_workers,
+            max_steps: common.max_steps, max_tokens: common.max_tokens, max_time: max_time.map(|d| d.as_secs()), session: common.session.clone() }).await;
+    }
     // a running daemon takes over `zcode run` (auto-approve runs only: a daemon cannot prompt a terminal); otherwise embedded
     if is_run && auto && !common.cont && common.session.is_none() && std::env::var_os("ZCODE_NO_DAEMON").is_none() && let Some(p) = &prompt {
-        let mode_s = match sandbox_mode(&common, &settings.raw)? { tools::Mode::None => "none", tools::Mode::Landlock => "landlock", tools::Mode::Warn => "warn", tools::Mode::Container => "container" };
-        let abs = |v: &Vec<std::path::PathBuf>| v.iter().map(|p| if p.is_absolute() { p.clone() } else { cwd.join(p) }).collect::<Vec<_>>();
-        let pol = serde_json::json!({"read": abs(&common.allow_read), "write": abs(&common.allow_write),
-            "net": common.net || settings.raw.get("net").and_then(|v| v.as_bool()).unwrap_or(false), "outside": common.allow_outside || auto});
-        let mw = common.max_workers.or_else(|| settings.raw.get("swarm").and_then(|s| s.get("max_workers")).and_then(|v| v.as_u64()).map(|n| n as usize)).unwrap_or(0);
+        let (mode_s, pol, mw) = daemon_request(&common, &settings, &cwd, auto)?;
         let req = client::Req { settings: &settings, cwd: &cwd, sandbox: mode_s, require_sandbox: common.require_sandbox, policy: pol, max_time: max_time.map(|d| d.as_secs()),
             max_steps: common.max_steps, max_tokens: common.max_tokens, max_workers: mw, format: common.format, thinking, prompt: p };
         if let Some(code) = client::try_run(req).await { return Ok(code); }
@@ -258,7 +270,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
     if max_workers > 0 {
         let g = |k: &str, d: u64| swarm_cfg.and_then(|s| s.get(k)).and_then(|v| v.as_u64()).unwrap_or(d);
         let cfg = swarm::SwarmCfg { max_workers, max_depth: g("max_depth", 1) as u32, pair_cap: g("pair_cap", 40) as u32, total_cap: g("total_cap", 400) as u32,
-            chain_cap: g("chain_cap", 16) as u32, concurrency: g("concurrency", 4) as usize, show_workers: common.show_workers, json: common.format == Format::Json };
+            chain_cap: g("chain_cap", 16) as u32, concurrency: g("concurrency", 4) as usize, show_workers: common.show_workers, json: common.format == Format::Json, unbounded: false };
         let sc = swarm::SpawnCtx { client: client_c, small: small_c, raw: settings.raw.clone(), policy, mode, auto, require: common.require_sandbox,
             session_base: agent.sid().to_string(), model: model_name.clone(), lead_tier, idmap_full, limits: agent.limits.clone(), format: common.format };
         let (sw, rx) = swarm::Swarm::new(cfg, sc, "lead", lead_sandbox);
@@ -319,6 +331,16 @@ fn upgrade() -> anyhow::Result<i32> {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum SandboxArg { None, Landlock, Warn, Container }
+
+/// What a daemon request carries from the command line: sandbox level, policy and worker count (same for `run` and `--group`).
+fn daemon_request(common: &Common, settings: &config::Settings, cwd: &std::path::Path, auto: bool) -> anyhow::Result<(&'static str, serde_json::Value, usize)> {
+    let mode_s = match sandbox_mode(common, &settings.raw)? { tools::Mode::None => "none", tools::Mode::Landlock => "landlock", tools::Mode::Warn => "warn", tools::Mode::Container => "container" };
+    let abs = |v: &Vec<std::path::PathBuf>| v.iter().map(|p| if p.is_absolute() { p.clone() } else { cwd.join(p) }).collect::<Vec<_>>();
+    let pol = serde_json::json!({"read": abs(&common.allow_read), "write": abs(&common.allow_write),
+        "net": common.net || settings.raw.get("net").and_then(|v| v.as_bool()).unwrap_or(false), "outside": common.allow_outside || auto});
+    let mw = common.max_workers.or_else(|| settings.raw.get("swarm").and_then(|s| s.get("max_workers")).and_then(|v| v.as_u64()).map(|n| n as usize)).unwrap_or(0);
+    Ok((mode_s, pol, mw))
+}
 
 fn sandbox_mode(common: &Common, raw: &serde_json::Value) -> anyhow::Result<tools::Mode> {
     let m = match (common.sandbox, raw.get("sandbox").and_then(|v| v.as_str())) {
