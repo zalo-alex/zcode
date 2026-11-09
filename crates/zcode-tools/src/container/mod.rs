@@ -490,16 +490,24 @@ fn alloc_port((lo, hi): (u16, u16)) -> Option<u16> {
 }
 
 /// Extract the embedded guest once to `~/.cache/zcode/guest-<version>` (size + hash checked), read-only.
-fn extract_guest(bytes: &'static [u8]) -> Result<PathBuf, String> {
+fn extract_guest(bytes: &'static [u8]) -> Result<PathBuf, String> { extract_into(&crate::local::cache_dir(), bytes) }
+
+fn extract_into(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let h = crate::fsops::hash(bytes);
-    let p = crate::local::cache_dir().join(format!("guest-{}-{:016x}", env!("CARGO_PKG_VERSION"), h));
+    let p = dir.join(format!("guest-{}-{:016x}", env!("CARGO_PKG_VERSION"), h));
     let ok = std::fs::read(&p).map(|b| b.len() == bytes.len() && crate::fsops::hash(&b) == h).unwrap_or(false);
     if !ok {
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        // two containers starting together in one process must not share a temp file (the pid alone is not unique)
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::rename(&tmp, &p) {
+            let _ = std::fs::remove_file(&tmp);
+            // another start finished first: fine as long as the file is complete
+            if !std::fs::read(&p).is_ok_and(|b| b.len() == bytes.len() && crate::fsops::hash(&b) == h) { return Err(e.to_string()); }
+        }
     }
     Ok(p)
 }

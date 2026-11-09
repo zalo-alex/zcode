@@ -55,3 +55,21 @@ fn sizes_parse() {
     assert_eq!(parse_size("1.5g"), Some((1.5 * (1u64 << 30) as f64) as u64));
     assert_eq!(parse_size("x"), None);
 }
+
+/// Containers that start together (a swarm spawning two workers) extract the guest at the same moment.
+#[test]
+fn concurrent_guest_extraction_does_not_race() {
+    let dir = std::env::temp_dir().join(format!("zc_guest_race_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    for round in 0..20 {
+        let d = dir.join(format!("r{round}"));
+        let hs: Vec<_> = (0..8).map(|_| { let (d, b) = (d.clone(), bytes.clone()); std::thread::spawn(move || extract_into(&d, &b)) }).collect();
+        let paths: Vec<PathBuf> = hs.into_iter().map(|h| h.join().unwrap().expect("every start must succeed")).collect();
+        assert!(paths.iter().all(|p| p == &paths[0]));
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes, "the extracted guest is complete");
+        let leftovers = std::fs::read_dir(&d).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".tmp")).count();
+        assert_eq!(leftovers, 0, "no temp files are left behind");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
