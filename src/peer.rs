@@ -32,7 +32,7 @@ pub struct Join<'a> {
     pub session: Option<String>,
 }
 
-const HELP: &str = "/help  /agents  /cost  /status  /exit   (Ctrl-C interrupts your agent; anything else you type is sent to it)";
+const HELP: &str = "/help  /agents  /cost  /status  /thinking [on|off]  /exit   (Ctrl-C interrupts your agent; anything else you type is sent to it)";
 
 enum Input { Line(String), Interrupt, Eof }
 
@@ -81,7 +81,8 @@ pub async fn attach(name: String) -> anyhow::Result<i32> {
     let st = call(&mut s, &mut n, "status", json!({"instance": name})).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let i = &st["instances"][0];
     let built = call(&mut s, &mut n, "build", json!({"instance": name})).await.map_err(anyhow::Error::msg)?;
-    call(&mut s, &mut n, "attach", json!({"instance": name})).await.map_err(anyhow::Error::msg)?;
+    // start from now: an instance that has been running for days must not replay its whole event ring into the terminal
+    call(&mut s, &mut n, "attach", json!({"instance": name, "since": i["events"].as_u64().unwrap_or(0)})).await.map_err(anyhow::Error::msg)?;
     let group = i["group"].as_str().unwrap_or("").to_string();
     let banner = vec![
         format!("{} {} · {}", "zcode".bold().cyan(), env!("CARGO_PKG_VERSION"), i["cwd"].as_str().unwrap_or("")),
@@ -89,7 +90,7 @@ pub async fn attach(name: String) -> anyhow::Result<i32> {
         format!("{}", format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed()),
         format!("{}", HELP.dimmed()),
     ];
-    interact(s, n, name, group, banner, false).await
+    interact(s, n, name, group, banner, false, i["thinking"].as_bool()).await
 }
 
 pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
@@ -114,11 +115,11 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
         format!("{}", "your agent can message the others with send; what they send back shows up here as it arrives".dimmed()),
         format!("{}", HELP.dimmed()),
     ];
-    interact(s, n, j.name, j.group, banner, true).await
+    interact(s, n, j.name, j.group, banner, true, None).await
 }
 
 /// The prompt loop, shared by `run` and `attach`. `close` = end the instance on exit (the agent we created), else just detach.
-async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Vec<String>, close: bool) -> anyhow::Result<i32> {
+async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Vec<String>, close: bool, thinking: Option<bool>) -> anyhow::Result<i32> {
     // keyboard: a thread (readline blocks), or plain lines when stdin is not a terminal
     let tty = std::io::stdin().is_terminal();
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Input>();
@@ -155,7 +156,7 @@ async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Ve
     let (fr_tx, mut fr_rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(async move { while let Ok(v) = read_frame(&mut rd).await { if fr_tx.send(v).is_err() { break; } } });
 
-    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false };
+    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false, rbuf: String::new(), thinking, thinking_req: None };
     let mut code = 0;
     loop {
         tokio::select! {
@@ -198,6 +199,10 @@ struct Peer {
     eof: bool,
     /// this step already streamed its text (`text` repeats it at the end of the step)
     streamed: bool,
+    /// reasoning streamed so far, up to its last newline (shown dim and italic)
+    rbuf: String,
+    thinking: Option<bool>,
+    thinking_req: Option<u64>,
 }
 
 impl Peer {
@@ -215,7 +220,12 @@ impl Peer {
         self.busy = true;
     }
 
+    fn flush_reasoning(&mut self, out: &mut Out) {
+        if !self.rbuf.is_empty() { let b = std::mem::take(&mut self.rbuf); out.line(&b.dimmed().italic().to_string()); }
+    }
+
     fn flush(&mut self, out: &mut Out) {
+        self.flush_reasoning(out);
         if !self.buf.is_empty() { let b = std::mem::take(&mut self.buf); out.line(&b); }
     }
 
@@ -228,7 +238,13 @@ impl Peer {
                 "help" => out.line(HELP),
                 "agents" => { let id = self.send("status", json!({})).await; self.agents_req = Some(id); }
                 "cost" => out.line(&format!("tokens in {} / out {}", self.tin, self.tout)),
-                "status" => out.line(&format!("group {} · agent {} · {}", self.group, self.name, if self.busy { "working" } else { "idle" })),
+                "status" => out.line(&format!("group {} · agent {} · {} · thinking {}", self.group, self.name, if self.busy { "working" } else { "idle" }, match self.thinking { Some(true) => "on", Some(false) => "off", None => "?" })),
+                "thinking" => {
+                    let arg = cmd.split_whitespace().nth(1).unwrap_or("");
+                    let on = match arg { "on" => Some(true), "off" => Some(false), "" => None, _ => { out.line("usage: /thinking [on|off]"); return false; } };
+                    let id = self.send("thinking", match on { Some(b) => json!({"on": b}), None => json!({}) }).await;
+                    self.thinking_req = Some(id);
+                }
                 _ => out.line(&format!("unknown command; {HELP}")),
             }
             return false;
@@ -251,6 +267,13 @@ impl Peer {
                     if e.contains("busy") { self.pending.push_front(text); self.busy = true; }  // a peer's message woke it first: our turn_end will resend
                     else { out.line(&format!("{} {e}", "error:".red())); self.busy = false; }
                 }
+            } else if self.thinking_req == Some(id) {
+                self.thinking_req = None;
+                if v["ok"] == true {
+                    let on = v["thinking"].as_bool().unwrap_or(false);
+                    self.thinking = Some(on);
+                    out.line(&format!("thinking {} (from your agent's next turn)", if on { "on" } else { "off" }));
+                } else { out.line(&format!("{} {}", "error:".red(), v["err"].as_str().unwrap_or(""))); }
             } else if self.agents_req == Some(id) {
                 self.agents_req = None;
                 if let Some(l) = v["instances"][0]["agents"].as_array() { for a in l.iter().filter_map(|x| x.as_str()) { out.line(a); } }
@@ -262,7 +285,12 @@ impl Peer {
             "step_start" if mine => { self.busy = true; self.streamed = false; }
             // an instance created without `stream`: the whole text of a step arrives at once
             "text" if mine && !self.streamed => { for l in v["part"]["text"].as_str().unwrap_or("").lines() { out.line(l); } }
+            "reasoning_delta" if mine => {
+                self.rbuf.push_str(v["delta"].as_str().unwrap_or(""));
+                while let Some(i) = self.rbuf.find('\n') { let line: String = self.rbuf.drain(..=i).collect(); out.line(&line.trim_end_matches('\n').dimmed().italic().to_string()); }
+            }
             "text_delta" if mine => {
+                self.flush_reasoning(out);
                 self.streamed = true;
                 self.buf.push_str(v["delta"].as_str().unwrap_or(""));
                 while let Some(i) = self.buf.find('\n') { let line: String = self.buf.drain(..=i).collect(); out.line(line.trim_end_matches('\n')); }

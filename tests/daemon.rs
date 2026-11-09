@@ -365,3 +365,50 @@ fn attach_uses_an_instance_another_client_created_and_leaving_only_detaches() {
     assert_ne!(code(&o), 0);
     assert!(err(&o).contains("no such instance"), "{}", err(&o));
 }
+
+#[test]
+fn thinking_is_off_by_default_and_can_be_switched_on_for_a_running_instance() {
+    let e = Env::new("d_think");
+    let llm = FakeLlm::start_fn(|_| Script::Reasoning("pondering the question".into(), "the answer".into()));
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "t1", &e.cwd, &llm, json!({"stream": true}));
+    c.ok("attach", json!({"instance": "t1"}));
+    assert_eq!(c.ok("thinking", json!({"instance": "t1"}))["thinking"], false);
+    c.ok("prompt", json!({"instance": "t1", "text": "one"}));
+    c.wait("first end", turn_end("t1"));
+    assert!(!c.events.iter().any(|x| x["type"] == "reasoning_delta"), "no reasoning while thinking is off");
+    assert_eq!(c.ok("thinking", json!({"instance": "t1", "on": true}))["thinking"], true);
+    assert_eq!(c.ok("status", json!({"instance": "t1"}))["instances"][0]["thinking"], true);
+    c.ok("prompt", json!({"instance": "t1", "text": "two"}));
+    c.wait("second end", |e| e["type"] == "turn_end" && e["instance"] == "t1" && e["seq"].as_u64().unwrap_or(0) > 10);
+    let r: String = c.events.iter().filter(|x| x["type"] == "reasoning_delta").map(|x| x["delta"].as_str().unwrap_or("")).collect();
+    assert!(r.contains("pondering the question"), "{r:?}");
+    // created with thinking on from the start
+    create(&mut c, "t2", &e.cwd, &llm, json!({"stream": true, "thinking": true}));
+    assert_eq!(c.ok("thinking", json!({"instance": "t2"}))["thinking"], true);
+}
+
+#[test]
+fn attach_shows_the_reasoning_and_slash_thinking_toggles_it() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let e = Env::new("d_attach_think");
+    let llm = FakeLlm::start_fn(|_| Script::Reasoning("weighing the options".into(), "final answer".into()));
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "w1", &e.cwd, &llm, json!({"stream": true, "thinking": true}));
+    let attach = |input: &str| {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_zcode")).args(["--attach", "w1"]).env_clear().env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("XDG_RUNTIME_DIR", e.dir.join("runtime")).env("NO_COLOR", "1").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        out(&child.wait_with_output().unwrap())
+    };
+    let shown = attach("question\n");
+    assert!(shown.contains("weighing the options") && shown.contains("final answer"), "{shown}");
+    let off = attach("/thinking off\nquestion\n");
+    assert!(off.contains("thinking off") && off.contains("final answer") && !off.contains("weighing the options"), "{off}");
+    assert_eq!(c.ok("thinking", json!({"instance": "w1"}))["thinking"], false, "the setting stays on the instance");
+    let bad = attach("/thinking maybe\n");
+    assert!(bad.contains("usage: /thinking"), "{bad}");
+}

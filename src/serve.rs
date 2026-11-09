@@ -80,6 +80,8 @@ struct Instance {
     swarm: Mutex<Option<Arc<Swarm>>>,
     sandbox: Mutex<Option<Arc<dyn Sandbox>>>,
     cancel: Arc<Cancel>,
+    /// stream the model's reasoning as `reasoning_delta` events (needs `stream`); changeable while the instance lives
+    thinking: AtomicBool,
     buf: Mutex<EventBuf>,
     tx: broadcast::Sender<Value>,
     ring_cap: usize,
@@ -158,7 +160,7 @@ impl Daemon {
         let ctx = Arc::new(tools::Ctx::with_sandbox(sandbox.clone(), net));
         let mut agent = Agent::new(client.clone(), ctx, AgentOpts {
             yes: true, allow_outside: policy.outside, guard: GuardMode::Deny, readonly: false, quiet: false, format: events::Format::Json,
-            limits: p.limits.clone(), small: small.clone(), thinking: false,
+            limits: p.limits.clone(), small: small.clone(), thinking: inst.thinking.load(Ordering::SeqCst),
         });
         agent.name = inst.name.clone();
         agent.daemon = true;
@@ -222,6 +224,7 @@ impl Daemon {
         if inst.crashed.load(Ordering::SeqCst) { return Err("instance crashed earlier; close it and create a new one".into()); }
         if inst.running.swap(true, Ordering::SeqCst) { return Err("instance is busy".into()); }
         let Some(mut agent) = inst.agent.lock().unwrap().take() else { inst.running.store(false, Ordering::SeqCst); return Err("instance is not ready".into()) };
+        agent.thinking = inst.thinking.load(Ordering::SeqCst);
         let cap = self.cfg.max_history_bytes;
         let sink = inst.sink();
         let sid = agent.sid().to_string();
@@ -350,7 +353,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
                     policy: req["policy"].clone(), limits, group, max_workers: req["max_workers"].as_u64().unwrap_or(0) as usize, stream: req["stream"].as_bool().unwrap_or(false),
                     session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from) },
                 agent: Mutex::new(None), build: tokio::sync::Mutex::new(false), running: AtomicBool::new(false), crashed: AtomicBool::new(false),
-                swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), buf: Mutex::new(EventBuf::default()), tx: btx, ring_cap: d.cfg.ring,
+                swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), thinking: AtomicBool::new(req["thinking"].as_bool().unwrap_or(false)), buf: Mutex::new(EventBuf::default()), tx: btx, ring_cap: d.cfg.ring,
             });
             map.insert(key, inst);
             Ok(json!({"instance": name, "session": session}))
@@ -430,6 +433,12 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             let (out, done) = stream.collect().await;
             Ok(json!({"code": done.code, "timed_out": done.timed_out, "output": out}))
         }
+        "thinking" => {
+            // show / hide the model's reasoning for this instance (takes effect from its next turn); no `on` = just report
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            if let Some(on) = req["on"].as_bool() { inst.thinking.store(on, Ordering::SeqCst); }
+            Ok(json!({"thinking": inst.thinking.load(Ordering::SeqCst)}))
+        }
         "cancel" => { d.find(app, str_of(req, "instance")?)?.cancel.cancel(); Ok(json!({})) }
         "close" => {
             let n = str_of(req, "instance")?.to_string();
@@ -446,6 +455,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
                 let sw = i.swarm.lock().unwrap().clone();
                 json!({"instance": i.name, "cwd": i.p.cwd, "group": i.p.group, "running": i.running.load(Ordering::SeqCst), "crashed": i.crashed.load(Ordering::SeqCst),
                     "built": i.agent.lock().unwrap().is_some() || i.running.load(Ordering::SeqCst), "events": i.buf.lock().unwrap().seq,
+                    "thinking": i.thinking.load(Ordering::SeqCst),
                     "pid": i.sandbox.lock().unwrap().as_ref().and_then(|s| s.init_pid()),
                     "ports": i.sandbox.lock().unwrap().as_ref().map(|s| s.ports().iter().map(|(g, h)| json!({"guest": g, "host": h})).collect::<Vec<_>>()).unwrap_or_default(),
                     "agents": sw.map(|s| s.list()).unwrap_or_default()})
