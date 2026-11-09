@@ -12,7 +12,7 @@ described at the bottom; they are single-machine, small samples: read them as or
 | idle REPL RSS (10 samples each) | 6.0-6.3 MB (mean 6.15) | 6.3-6.8 MB (mean 6.5) | **+~0.35 MB (~+6%)**, down from +0.55 MB: anonymous memory is identical (+20 KB), the rest is shared file-backed code pages. Fixed by `opt-level = "s"` and a lazy tier 1 build; the remainder is explained in `docs/technical/KNOWN_GAPS.md`. With `panic = "unwind"` (the `serve` profile) it is +~0.3 MB more |
 | fixed prompt (system + tool schemas) | ~1475 tokens (14 tools) | ~1475 tokens (14 tools) | identical by default |
 | fixed prompt with `--max-workers N` (lead) | n/a | ~1778 tokens (+3 tools, +~300) | opt-in only: the swarm tools and the swarm prompt are absent unless enabled |
-| binary size | 7,956,936 B | 8,367,040 B (**+0.41 MB**; was +3.21 MB at `opt-level = 3`) | of which the embedded static musl guest is 2,475,040 B (2.36 MiB), so the host part is 5.89 MB against 7.96 MB for 0.2.0: the size-optimised profile shrank all host code (old and new) by ~2.8 MB, which pays for the guest and the new tier 1/2, swarm and daemon code. `--features oci` adds 152 KB (8,519,552 B) |
+| binary size | 7,956,936 B | 8,463,432 B (**+0.51 MB**; was +3.21 MB at `opt-level = 3`) | of which the embedded static musl guest is 2,475,040 B (2.36 MiB), so the host part is 5.89 MB against 7.96 MB for 0.2.0: the size-optimised profile shrank all host code (old and new) by ~2.8 MB, which pays for the guest and the new tier 1/2, swarm and daemon code. `--features oci` adds about 150 KB |
 
 ## Per-command overhead and setup (wall time of a whole `zcode run` against a local fake model server)
 

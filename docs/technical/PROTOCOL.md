@@ -37,6 +37,7 @@ Flags (accepted before or after `run`):
 | `--max-workers N` | enable the swarm with up to N workers (see *Swarm*) |
 | `--keep-state` / `--require-limits` | tier 2: keep container upper layers after the run / fail instead of skipping cgroup limits without delegation |
 | `--show-workers` | print worker progress lines |
+| `--group G` / `--agent NAME` | interactive only, needs `zcode serve` and `--auto`: run this terminal's agent inside the daemon, in group `G`, under the name `NAME` (default `zcode-<pid>`), so agents in other terminals of the group can message it and it them. See [DAEMON.md](DAEMON.md#interactive-agents-in-a-group-zcode---group) |
 
 ### Exit codes
 `0` finished · `1` error (API, config, session id, a sandbox tier that cannot be enforced…) · `3` stopped by a limit (time, steps, token budget, exploration loop; with a swarm the budgets cover the whole swarm; through the daemon the same codes arrive in `turn_end.code`) · `130` interrupted (Ctrl-C / daemon `cancel`) · `143` SIGTERM/SIGHUP.

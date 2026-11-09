@@ -63,6 +63,7 @@ Every `▸` line is a tool zcode used. Nothing outside your project is touched u
 | Use several workers | `zcode run --auto --max-workers 3 "…"` |
 | Run in a private container | `zcode run --auto --sandbox container "…"` |
 | Download a container image | `zcode image pull alpine:3.20` |
+| Let agents in two terminals talk to each other | `zcode serve`, then `zcode --group duo --agent alice --auto` and `zcode --group duo --agent bob --auto` |
 | Update zcode | `zcode upgrade` |
 
 ## Exit codes

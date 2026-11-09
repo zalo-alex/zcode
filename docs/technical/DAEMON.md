@@ -23,7 +23,8 @@ Config (`serve` key of the daemon's own config): `max_instances` (64), `max_hist
 | op | fields | notes |
 |---|---|---|
 | `hello` | `app`, `token` | only needed when `serve.apps` is set; instances and groups are namespaced per app |
-| `create` | `instance`, `cwd`, `config`, `model?`, `sandbox?` (default `landlock`), `profile?`, `policy?` `{read,write,net,outside}`, `limits?` `{max_time,max_steps,max_tokens}`, `group?`, `max_workers?`, `stream?`, `session?` | allocation only: no model client, sandbox, session file or agent exists until the first `prompt`/`send`/`spawn`. Instance and group names are `[A-Za-z0-9_-]{1,32}` |
+| `create` | `instance`, `cwd`, `config`, `model?`, `sandbox?` (default `landlock`), `profile?`, `policy?` `{read,write,net,outside}`, `limits?` `{max_time,max_steps,max_tokens}`, `group?`, `max_workers?`, `stream?`, `session?`, `close_on_disconnect?` | allocation only: no model client, sandbox, session file or agent exists until the first `prompt`/`send`/`spawn`. Instance and group names are `[A-Za-z0-9_-]{1,32}` |
+| `build` | `instance` | build the instance now (model client, sandbox, agent, joining its group, so that it can receive messages) instead of at the first `prompt`/`send`/`spawn`. Replies `{agents: [...]}`, the group's agents as `/agents` lists them |
 | `attach` | `instance`, `since?` | subscribes this connection to the instance's events; the ring is replayed first (events with `seq > since`) |
 | `detach` | `instance` | |
 | `prompt` | `instance`, `text` | one turn at a time (`instance is busy` otherwise); the end of the turn arrives as a `turn_end` event |
@@ -33,9 +34,20 @@ Config (`serve` key of the daemon's own config): `max_instances` (64), `max_hist
 | `close` | `instance` | stops workers, closes sandboxes/containers, forgets the instance |
 | `status` | `instance?` | state, queue, per-agent budgets (as `/agents`) |
 
+## Interactive agents in a group (`zcode --group`)
+
+`zcode --group NAME [--agent AGENT] --auto` is a client of this protocol for people: it `create`s an instance named after the agent with `group`, `stream: true` and `close_on_disconnect: true`, calls `build` so the agent is in the group and answers messages at once, `attach`es, and then forwards each line you type as a `prompt` and renders the event stream. It needs a running daemon (`zcode serve`) and `--auto`, because the daemon cannot ask for permission.
+
+Agents of one group share one bus: `send(to, text)` reaches any agent of the group by its instance name, and a message to an idle agent wakes it (the daemon starts a turn: `[from name] ...`), whether or not anyone is typing at it. Group specifics:
+
+* The group has no swarm-wide step, token or time budget (each turn keeps its own `limits`): groups are long-lived.
+* The caps on agent-to-agent chatter (`pair_cap`, `total_cap`, `chain_cap`) are re-armed whenever a person's `prompt` arrives, so they stop agents answering each other forever without ending a long conversation between people.
+* `close_on_disconnect` ends the instance when the creating connection closes (a terminal that died must not leave an agent answering colleagues with nobody to read it). Without the flag, instances outlive their connection as usual.
+* An agent only shares files with a peer whose `cwd` is the same folder; messages carry summaries and paths.
+
 ## Events
 
-The `--format json` events (`step_start`, `text`, `tool_use`, `step_finish`, `error`, `reasoning`) plus the swarm events (`spawn`, `message`, `idle`, `port`), each with `instance` and `agent` (`agent` is the instance name for its lead) and a per-instance `seq`. Extra events: `turn_end` `{stop: done|limit|interrupted|error, code: 0|3|130|1, message, text}` (the exit codes of `zcode run`), `warning`, `closed`; with `stream: true` also `text_delta`, `reasoning_delta` and `tool_start`.
+The `--format json` events (`step_start`, `text`, `tool_use`, `step_finish`, `error`, `reasoning`) plus the swarm events (`spawn`, `message`, `idle`, `port`) and `incoming` (`from`, `text`: a message from another agent was delivered to this instance's agent, before the turn it triggers), each with `instance` and `agent` (`agent` is the instance name for its lead) and a per-instance `seq`. Extra events: `turn_end` `{stop: done|limit|interrupted|error, code: 0|3|130|1, message, text}` (the exit codes of `zcode run`), `warning`, `closed`; with `stream: true` also `text_delta`, `reasoning_delta` and `tool_start`.
 
 ## Lifetime and limits
 
