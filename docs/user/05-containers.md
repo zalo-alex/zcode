@@ -230,6 +230,38 @@ Two things to know:
 
 These need cgroup v2 delegation (systemd gives it to your user session on most distros). Without it zcode skips them and warns once; add `--require-limits` to fail instead.
 
+## Customize the container
+
+Like `docker run -v/-e/--cap-add/--ulimit/--sysctl`. Put these under `"container"` in the config (all containers), or under `"container"` inside a profile (that agent only). A profile adds to the global lists, merges the maps by key and replaces single values.
+
+```json
+{
+  "container": {
+    "mounts": ["~/.cache/pip:/root/.cache/pip", "/data:/data:ro"],
+    "tmpfs": ["/scratch:size=256m"],
+    "env": { "FOO": "bar" },
+    "cap_add": ["NET_RAW"],
+    "ulimits": { "nofile": [8192, 8192] }
+  },
+  "profiles": { "build": { "sandbox": "container", "container": { "mounts": ["/opt/sdk:/opt/sdk:ro"] } } }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `mounts` | host paths to bind: `"src:dst[:opts]"` (`ro`, `rw`, `suid`, `dev`) or `{"src","dst","ro"}`. `~` works; paths must be absolute; a missing source is an error. Default `nosuid,nodev`, read-write unless `ro`. |
+| `tmpfs` | `"dst[:opts]"`, e.g. `/scratch:size=256m` |
+| `env` | object or `["K=V"]`; overrides the defaults (`PATH`, `HOME`, ...). Host variables are never passed. |
+| `hostname`, `user` | hostname; `"uid[:gid]"` inside the container |
+| `cap_add`, `cap_drop` | capability names, with or without `CAP_` |
+| `ulimits` | `{"nofile": 4096}` or `{"nofile": [soft, hard]}` |
+| `sysctls` | `{"net.ipv4.ping_group_range": "0 0"}`. Rootless: only network-namespace sysctls work, and values must fit the single-id mapping (so `0 0`, not `0 2147483647`); `kernel.*` ones are refused with "Permission denied". |
+| `devices` | host device nodes made available at the same path |
+| `seccomp_deny`, `seccomp_allow` | add / remove syscalls in the deny list |
+| `oci_patch` | any OCI `config.json` fields, merged last ([JSON merge-patch](https://www.rfc-editor.org/rfc/rfc7386): `null` deletes a key, arrays are replaced) |
+
+You are in charge of what you mount: a mount can expose host files (`~/.ssh`) to the agent, and `oci_patch` can switch off protections such as `noNewPrivileges`. Mount read-only whenever you can.
+
 ## All container settings
 
 Everything is optional, under `"container"` in the config:

@@ -1,5 +1,6 @@
 //! OCI runtime `config.json`, built with serde_json from a small template plus the agent's Policy.
 use serde_json::{Value, json};
+use super::custom::{Custom, merge_patch};
 use std::path::{Path, PathBuf};
 
 pub struct Spec<'a> {
@@ -20,6 +21,7 @@ pub struct Spec<'a> {
     pub cgroup_path: Option<String>,
     pub seccomp: bool,
     pub readonly_rootfs: bool,
+    pub custom: &'a Custom,
 }
 
 const DENY_SYSCALLS: &[&str] = &[
@@ -58,8 +60,11 @@ pub fn config(s: &Spec) -> Value {
         mounts.push(bind(s.project, s.project, &["rbind", "ro", "rro", "nosuid", "nodev"]));
         for w in s.write { mounts.push(bind(w, w, &["rbind", "nosuid", "nodev"])); }
     }
-    let caps = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
-        "CAP_NET_BIND_SERVICE", "CAP_NET_ADMIN", "CAP_SYS_CHROOT", "CAP_SETFCAP"];
+    mounts.extend(s.custom.oci_mounts());
+    let mut caps: Vec<String> = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
+        "CAP_NET_BIND_SERVICE", "CAP_NET_ADMIN", "CAP_SYS_CHROOT", "CAP_SETFCAP"].iter().map(|x| x.to_string()).collect();
+    for c in &s.custom.cap_add { if !caps.contains(c) { caps.push(c.clone()); } }
+    caps.retain(|c| !s.custom.cap_drop.contains(c));
     let mut linux = json!({
         "namespaces": [{"type":"pid"},{"type":"network"},{"type":"ipc"},{"type":"uts"},{"type":"mount"}],
         "maskedPaths": ["/proc/acpi","/proc/kcore","/proc/keys","/proc/latency_stats","/proc/timer_list","/proc/timer_stats","/proc/sched_debug","/proc/scsi","/sys/firmware"],
@@ -67,7 +72,9 @@ pub fn config(s: &Spec) -> Value {
         "rootfsPropagation": "private",
     });
     if s.seccomp {
-        linux["seccomp"] = json!({"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":DENY_SYSCALLS,"action":"SCMP_ACT_ERRNO","errnoRet":1}]});
+        let mut deny: Vec<&str> = DENY_SYSCALLS.iter().copied().filter(|n| !s.custom.seccomp_allow.iter().any(|a| a == n)).collect();
+        for d in &s.custom.seccomp_deny { if !deny.contains(&d.as_str()) { deny.push(d); } }
+        linux["seccomp"] = json!({"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":deny,"action":"SCMP_ACT_ERRNO","errnoRet":1}]});
     }
     let mut res = json!({});
     if let Some(m) = s.mem { res["memory"] = json!({"limit": m, "swap": m}); }
@@ -77,23 +84,35 @@ pub fn config(s: &Spec) -> Value {
         linux["resources"] = res;
         if let Some(p) = &s.cgroup_path { linux["cgroupsPath"] = json!(p); }
     }
-    json!({
+    if !s.custom.sysctls.is_empty() { linux["sysctl"] = json!(s.custom.sysctls); }
+    let mut env: Vec<String> = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=xterm", "LANG=C.UTF-8", "TMPDIR=/tmp"].iter().map(|x| x.to_string()).collect();
+    for (k, v) in &s.custom.env {
+        env.retain(|e| !e.starts_with(&format!("{k}=")));
+        env.push(format!("{k}={v}"));
+    }
+    let mut rlimits = vec![("nofile".to_string(), (4096, 4096)), ("core".to_string(), (0, 0))];
+    for (k, v) in &s.custom.ulimits { rlimits.retain(|(n, _)| n != k); rlimits.push((k.clone(), *v)); }
+    let rlimits: Vec<Value> = rlimits.into_iter().map(|(n, (soft, hard))| json!({"type": format!("RLIMIT_{}", n.to_uppercase()), "hard": hard, "soft": soft})).collect();
+    let (uid, gid) = s.custom.user.unwrap_or((0, 0));
+    let mut cfg = json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
-            "user": {"uid": 0, "gid": 0},
+            "user": {"uid": uid, "gid": gid},
             "args": ["/zcode-guest", "--connect", "/run/zcode/g.sock", "--cwd", s.project],
-            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=xterm", "LANG=C.UTF-8", "TMPDIR=/tmp"],
+            "env": env,
             "cwd": s.project,
             "noNewPrivileges": true,
             "capabilities": {"bounding": caps, "effective": caps, "permitted": caps, "inheritable": [], "ambient": []},
-            "rlimits": [{"type":"RLIMIT_NOFILE","hard":4096,"soft":4096},{"type":"RLIMIT_CORE","hard":0,"soft":0}],
+            "rlimits": rlimits,
         },
         "root": {"path": s.rootfs, "readonly": s.readonly_rootfs},
-        "hostname": format!("zc-{}", s.agent),
+        "hostname": s.custom.hostname.clone().unwrap_or_else(|| format!("zc-{}", s.agent)),
         "mounts": mounts,
         "linux": linux,
-    })
+    });
+    if let Some(p) = &s.custom.oci_patch { merge_patch(&mut cfg, p); }
+    cfg
 }
 
 #[cfg(test)]
@@ -103,7 +122,7 @@ mod tests {
     fn project_ro_then_rw_in_order() {
         let w = [PathBuf::from("/p/out")];
         let s = Spec { rootfs: Path::new("/r"), project: Path::new("/p"), project_rw: false, write: &w, guest: Path::new("/g"), sockdir: Path::new("/s"), resolv: None,
-            agent: "a", net: false, mem: Some(1 << 30), cpus: Some(2.0), pids: None, cgroup_path: Some("x/y".into()), seccomp: true, readonly_rootfs: false };
+            agent: "a", net: false, mem: Some(1 << 30), cpus: Some(2.0), pids: None, cgroup_path: Some("x/y".into()), seccomp: true, readonly_rootfs: false, custom: &Custom::default() };
         let c = config(&s);
         let m = c["mounts"].as_array().unwrap();
         let ro = m.iter().position(|x| x["destination"] == "/p").unwrap();

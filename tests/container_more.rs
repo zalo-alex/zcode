@@ -279,3 +279,69 @@ fn a_missing_net_backend_fails_spawn_cleanly_and_the_lead_continues() {
     let s = tool_outputs(&json_lines(&o), "lead", "spawn").concat();
     assert!(s.contains("passt") && s.contains("slirp4netns") && s.contains("use net=false"), "{s}");
 }
+
+#[test]
+fn custom_mounts_env_and_profile_layering() {
+    let host = std::env::temp_dir().join(format!("zc_custom_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&host);
+    let (ro, rw) = (host.join("ro"), host.join("rw"));
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::create_dir_all(&rw).unwrap();
+    std::fs::write(ro.join("f.txt"), "from-host\n").unwrap();
+    let cfgj = json!({
+        "container": {"mounts": [format!("{}:/mnt/ro:ro", ro.display()), format!("{}:/mnt/rw", rw.display())], "env": {"ZC_G": "global", "ZC_O": "g"}, "hostname": "custombox", "tmpfs": ["/scratch:size=1m"]},
+        "profiles": {"box": {"sandbox": "container", "container": {"env": {"ZC_O": "profile"}}}}
+    });
+    let Some((e, cfg)) = setup("c_custom", cfgj) else { return };
+    let llm = FakeLlm::start_fn(|r| {
+        let (w, n) = (who(r), n_assist(r));
+        match (w.as_str(), n) {
+            ("lead", 0) => tool("bash", json!({"command":"cat /mnt/ro/f.txt; echo wro=$(touch /mnt/ro/x >/dev/null 2>&1 && echo ok || echo denied); echo hi > /mnt/rw/out.txt; echo env=$ZC_G,$ZC_O; hostname; echo scratch=$(touch /scratch/a && echo ok)"})),
+            ("lead", 1) => tool("spawn", json!({"name":"w","prompt":"env","profile":"box"})),
+            ("lead", 2) => tool("wait", json!({})),
+            ("lead", _) => text("fin"),
+            (_, 0) => tool("bash", json!({"command":"echo wenv=$ZC_G,$ZC_O; cat /mnt/ro/f.txt"})),
+            _ => text("done"),
+        }
+    });
+    let o = cmd(&e, &llm, cfg, &["--sandbox", "container", "--max-workers", "2"]).output().unwrap();
+    if skip_if_unavailable(&o) { return; }
+    assert_eq!(code(&o), 0, "{}\n{}", err(&o), out(&o));
+    let l = json_lines(&o);
+    let b = tool_outputs(&l, "lead", "bash").concat();
+    assert!(b.contains("from-host") && b.contains("wro=denied") && b.contains("env=global,g") && b.contains("custombox") && b.contains("scratch=ok"), "{b}");
+    assert_eq!(std::fs::read_to_string(rw.join("out.txt")).unwrap(), "hi\n");
+    assert!(!ro.join("x").exists());
+    let w = tool_outputs(&l, "w", "bash").concat();
+    assert!(w.contains("wenv=global,profile") && w.contains("from-host"), "{w}");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[test]
+fn custom_mount_with_missing_source_fails_cleanly() {
+    let Some((e, cfg)) = setup("c_custom_bad", json!({"container": {"mounts": ["/definitely/not/here:/z"]}})) else { return };
+    let llm = FakeLlm::start_fn(|_| text("fin"));
+    let o = cmd(&e, &llm, cfg, &["--sandbox", "container"]).output().unwrap();
+    let s = err(&o) + &out(&o);
+    assert!(s.contains("container.mounts: source `/definitely/not/here` does not exist"), "{s}");
+    assert_ne!(code(&o), 0);
+}
+
+#[test]
+fn custom_caps_ulimits_sysctls_and_oci_patch_apply() {
+    let Some((e, cfg)) = setup("c_custom_caps", json!({"container": {
+        "cap_add": ["net_raw"], "cap_drop": ["NET_ADMIN"], "ulimits": {"nofile": [777, 888]}, "sysctls": {"net.ipv4.ping_group_range": "0 0"},
+        "oci_patch": {"hostname": "patched"}
+    }})) else { return };
+    let llm = FakeLlm::start_fn(|r| match n_assist(r) {
+        0 => tool("bash", json!({"command":"b=$(awk '/CapBnd/{print $2}' /proc/self/status); echo netraw=$(( 0x$b >> 13 & 1 )) netadmin=$(( 0x$b >> 12 & 1 )) chown=$(( 0x$b & 1 )); echo nofile=$(ulimit -n) hard=$(ulimit -Hn); echo ping=$(cat /proc/sys/net/ipv4/ping_group_range) host=$(hostname)"})),
+        _ => text("fin"),
+    });
+    let o = cmd(&e, &llm, cfg, &["--sandbox", "container"]).output().unwrap();
+    if skip_if_unavailable(&o) { return; }
+    assert_eq!(code(&o), 0, "{}\n{}", err(&o), out(&o));
+    let b = tool_outputs(&json_lines(&o), "lead", "bash").concat();
+    assert!(b.contains("netraw=1 netadmin=0 chown=1"), "{b}");
+    assert!(b.contains("nofile=777") && b.contains("hard=888"), "{b}");
+    assert!(b.contains("ping=0 0") && b.contains("host=patched"), "{b}");
+}

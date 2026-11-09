@@ -407,6 +407,7 @@ impl Swarm {
             pids: prof.get("pids").and_then(|v| v.as_u64()),
             ports: prof.get("ports").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|p| p as u16)).collect()).unwrap_or_default(),
             project_rw: false,
+            custom: prof.get("container").cloned(),
         };
         if mode == Mode::Container && sc.lead_tier < Tier::Container && sc.idmap_full {
             eprintln!("warning: container.idmap is \"full\" while the lead runs on the host: files written by container workers will not be owned by the host user; use idmap \"single\" for mixed tiers");

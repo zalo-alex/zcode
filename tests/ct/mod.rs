@@ -24,16 +24,27 @@ pub fn tool_outputs(lines: &[Value], agent: &str, name: &str) -> Vec<String> {
 pub fn fixture() -> Option<&'static Path> {
     static F: OnceLock<Option<PathBuf>> = OnceLock::new();
     F.get_or_init(|| {
+        // ZCODE_TEST_ROOTFS=<dir>: use a real image rootfs (e.g. a pulled alpine) instead of building a busybox one
+        if let Ok(d) = std::env::var("ZCODE_TEST_ROOTFS") { return Some(PathBuf::from(d)); }
         let bb = ["/usr/bin/busybox", "/bin/busybox"].iter().map(Path::new).find(|p| p.exists())?;
         let ldd = Command::new("ldd").arg(bb).output().ok()?;
-        if !String::from_utf8_lossy(&ldd.stdout).contains("not a dynamic") && !String::from_utf8_lossy(&ldd.stderr).contains("not a dynamic") {
-            eprintln!("SKIP: {} is not static", bb.display());
-            return None;
-        }
+        let ldd_out = String::from_utf8_lossy(&ldd.stdout).to_string() + &String::from_utf8_lossy(&ldd.stderr);
+        let is_static = ldd_out.contains("not a dynamic");
         let root = std::env::temp_dir().join(format!("zc_fixture_rootfs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for d in ["bin", "etc", "root", "usr/bin"] { std::fs::create_dir_all(root.join(d)).ok()?; }
         std::fs::copy(bb, root.join("bin/busybox")).ok()?;
+        if !is_static {
+            // dynamic busybox (Debian): ship the libraries it needs, at the same paths
+            for l in ldd_out.lines() {
+                let p = l.split("=>").last().unwrap_or(l).split_whitespace().next().unwrap_or("");
+                if p.starts_with('/') && Path::new(p).exists() {
+                    let dst = root.join(p.trim_start_matches('/'));
+                    std::fs::create_dir_all(dst.parent()?).ok()?;
+                    std::fs::copy(p, &dst).ok()?;
+                }
+            }
+        }
         Command::new(root.join("bin/busybox")).args(["--install", "-s", "/bin"]).env("PATH", "/bin").current_dir(&root).output().ok();
         // `--install -s /bin` would write on the host if not careful: do it relative to the fixture instead
         let st = Command::new(root.join("bin/busybox")).arg("--list").output().ok()?;

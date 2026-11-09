@@ -43,6 +43,8 @@ pub struct ContainerOpts {
     pub ports: Vec<u16>,
     /// the lead owns the whole project read-write
     pub project_rw: bool,
+    /// the profile's raw `container` object, layered over the global `container` customization
+    pub custom: Option<serde_json::Value>,
 }
 
 /// What one agent may touch.

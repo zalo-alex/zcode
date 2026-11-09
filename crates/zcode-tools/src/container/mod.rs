@@ -4,6 +4,7 @@
 //! per-agent dirs -> `RootfsProvider` plan -> bundle `config.json` -> unix socket -> `zcode __ns`
 //! supervisor (userns + mount namespace + overlay, then OCI `create`/`start`) -> optional `pasta` ->
 //! guest connects out -> ready. The first tool call awaits the ready future.
+mod custom;
 mod image;
 mod oci;
 mod probe;
@@ -16,6 +17,7 @@ mod supervisor;
 pub use registry::{gc as image_gc, pull as image_pull};
 pub use image::{images_dir, import as image_import, list as image_list, remove as image_remove, rootfs_of};
 pub use supervisor::maybe_run as maybe_supervisor;
+pub use custom::Custom;
 
 use crate::frames::{read_frame, write_frame};
 use crate::sandbox::*;
@@ -51,6 +53,8 @@ pub struct ContainerCfg {
     /// `auto` (pasta, else slirp4netns) | `pasta` | `slirp4netns`
     pub net_backend: String,
     pub slirp: String,
+    /// user customization of the container (mounts, env, caps, ...)
+    pub custom: Custom,
     pub guest: &'static [u8],
 }
 
@@ -69,8 +73,9 @@ impl ContainerCfg {
             return Err(format!("container.net_backend must be auto|pasta|slirp4netns, got `{}`", s("net_backend", "auto")));
         }
         let pr = c.get("port_range").and_then(|v| v.as_array()).map(|a| (a.first().and_then(|x| x.as_u64()).unwrap_or(20000) as u16, a.get(1).and_then(|x| x.as_u64()).unwrap_or(29999) as u16)).unwrap_or((20000, 29999));
+        let custom = Custom::from_value(&c)?;
         Ok(ContainerCfg {
-            runtime, runtime_args, image: s("image", "alpine"), idmap, rootfs: s("rootfs", "auto"),
+            custom, runtime, runtime_args, image: s("image", "alpine"), idmap, rootfs: s("rootfs", "auto"),
             seccomp: c.get("seccomp").and_then(|v| v.as_str()) != Some("none"),
             readonly_rootfs: c.get("readonly_rootfs").and_then(|v| v.as_bool()).unwrap_or(false),
             port_range: pr, keep_state: keep_state || c.get("keep_state").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -285,7 +290,9 @@ pub struct ContainerSandbox {
 
 /// Create the sandbox. Must be called inside a tokio runtime; the container starts in the background.
 pub fn open(policy: Policy, opts: ContainerOpts) -> Result<ContainerSandbox, String> {
-    let cfg = CFG.get().ok_or("tier 2 is not configured in this build")?.clone();
+    let mut cfg = CFG.get().ok_or("tier 2 is not configured in this build")?.clone();
+    if let Some(p) = &opts.custom { cfg.custom = cfg.custom.merged(&Custom::from_value(p)?); }
+    cfg.custom.validate()?;
     // cheap synchronous prerequisites now (cached); heavy work happens in the background task
     let probe = probe::check(&cfg)?;
     if cfg.idmap == Idmap::Full {
@@ -344,7 +351,7 @@ async fn setup(cfg: ContainerCfg, probe: probe::Probe, policy: Policy, opts: Con
         resolv: (net_be == Some(Net::Slirp)).then_some(resolv.as_path()),
         rootfs: &rootfs_path, project: &policy.cwd, project_rw: opts.project_rw, write: &policy.write, guest: &guest, sockdir: &sockdir,
         agent: &agent, net: opts.net, mem: if use_limits { opts.mem } else { None }, cpus: if use_limits { opts.cpus } else { None },
-        pids: if use_limits { opts.pids } else { None }, cgroup_path: if use_limits { cgroup_path } else { None }, seccomp: cfg.seccomp, readonly_rootfs: cfg.readonly_rootfs,
+        pids: if use_limits { opts.pids } else { None }, cgroup_path: if use_limits { cgroup_path } else { None }, seccomp: cfg.seccomp, readonly_rootfs: cfg.readonly_rootfs, custom: &cfg.custom,
     };
     std::fs::write(bundle.join("config.json"), serde_json::to_vec_pretty(&oci::config(&spec)).unwrap()).map_err(|e| e.to_string())?;
     let mut runtime_args = cfg.runtime_args.clone();
