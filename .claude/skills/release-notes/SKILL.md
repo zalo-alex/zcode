@@ -10,7 +10,8 @@ release description.
 
 ## Steps
 
-1. **Collect the commits** with one command (no shell variables or pipes needed):
+1. **Pull the tags** first so the previous/latest tag is known locally: `git fetch --tags`.
+2. **Collect the commits** with one command (no shell variables or pipes needed):
    ```bash
    python /home/alex/dev/zcode/.claude/skills/release-notes/collect_commits.py [TAG]
    ```
@@ -18,11 +19,19 @@ release description.
    - No `TAG`: commits since the latest tag up to `HEAD` (release not tagged yet). Use the version the user names for
      the title, else say "Unreleased".
    - Output: range, compare URL, then per commit: hash, subject, body, changed files with +/- counts.
-2. **Understand vague subjects.** Commit subjects are short (under 40 chars) on purpose. When a subject doesn't say
+3. **Check the version.** `version` in the root `Cargo.toml`, `crates/*/Cargo.toml` and `Cargo.lock` must equal the
+   release version (tag without `v`), because `zcode --version` prints it. Which tree to check depends on the case:
+   - **Releasing** (no `TAG`, or the tag doesn't exist yet): check the working tree. If it differs, tell the user in
+     the answer that the version must be bumped before the tag is made.
+   - **Already released** (tag exists): check the tag's files, e.g. `git show vX.Y.Z:Cargo.toml`. If it differs, the
+     published binaries report the wrong version and can't be fixed; say so and that the next release must carry the
+     right one. Don't suggest re-tagging.
+   Don't edit the version unless asked.
+4. **Understand vague subjects.** Commit subjects are short (under 40 chars) on purpose. When a subject doesn't say
    what a user would notice, look at the files list and, if still unclear, `git show <hash>` for that commit only.
-3. **Write the notes** (rules below), save them to a fresh temp file `release-notes.md` (e.g. via `mktemp -d`), and
+5. **Write the notes** (rules below), save them to a fresh temp file `release-notes.md` (e.g. via `mktemp -d`), and
    don't touch the repo.
-4. **Answer** with the markdown in a fenced ```` ```markdown ```` block, then the file as a clickable markdown link
+6. **Answer** with the markdown in a fenced ```` ```markdown ```` block, then the file as a clickable markdown link
    `[release-notes.md](/abs/path/release-notes.md)` (never in backticks). One plain line outside the block if you
    skipped or merged anything noteworthy.
 
