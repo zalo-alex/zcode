@@ -329,7 +329,7 @@ impl Daemon {
             o => return Err(format!("sandbox must be none|landlock|warn|container, got `{o}`")),
         };
         let l = &req["limits"];
-        let limits = Limits { max_time: l["max_time"].as_u64().filter(|n| *n > 0).map(Duration::from_secs), max_steps: l["max_steps"].as_u64().unwrap_or(60) as usize, max_tokens: l["max_tokens"].as_u64().unwrap_or(400_000) };
+        let limits = Limits { max_time: l["max_time"].as_u64().filter(|n| *n > 0).map(Duration::from_secs), max_steps: l["max_steps"].as_u64().unwrap_or(60) as usize, max_tokens: crate::agent::unlimited_tokens(l["max_tokens"].as_u64().unwrap_or(0)) };
         let session = req["session"].as_str().map(String::from).unwrap_or_else(session::new_id);
         let mut map = self.instances.lock().unwrap();
         if map.len() >= self.cfg.max_instances { return Err(format!("instance limit reached ({})", self.cfg.max_instances)); }

@@ -122,7 +122,7 @@ $ echo $?
 | Flag | Limit | Default |
 |---|---|---|
 | `--max-steps N` | model requests per turn | 60 |
-| `--max-tokens N` | prompt tokens used per turn | 400000 |
+| `--max-tokens N` | prompt tokens used per turn (`0` = no limit; `--max-steps` and `--max-time` still bound a turn) | 0 |
 | `--max-time SECONDS` | wall-clock time per turn (`0` = none) | 1200 for `run`, none in the interactive mode |
 
 zcode also stops by itself if it notices it is just reading files in circles ("exploration loop"). With [workers](04-teams-of-agents.md) these limits cover the **whole team**.

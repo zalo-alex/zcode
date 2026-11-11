@@ -29,7 +29,7 @@ Flags (accepted before or after `run`):
 | `--thinking` / `--no-thinking` | show / hide the model's reasoning (`reasoning_content` stream). Default: on in the REPL, off for `run`. Config key `thinking: true|false`. REPL: `/thinking` toggles |
 | `--max-time SECS` | wall-clock limit per turn, `0` = none. Default 1200 for `run`, none in the REPL |
 | `--max-steps N` | model steps per turn (default 60) |
-| `--max-tokens N` | cumulative prompt tokens per turn (default 400000) |
+| `--max-tokens N` | cumulative prompt tokens per turn (default 0 = no limit) |
 | `--sandbox none\|landlock\|warn\|container` | isolation tier, see *Sandbox* below. Default `landlock` (tier 1). Config key `sandbox` |
 | `--require-sandbox` | fail instead of running with a weaker sandbox than requested |
 | `--allow-read PATH` / `--allow-write PATH` | extra read-only / read-write sandbox paths (repeatable) |

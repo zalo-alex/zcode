@@ -117,8 +117,8 @@ struct Common {
     /// Max model steps per turn
     #[arg(long, default_value_t = 60, global = true)]
     max_steps: usize,
-    /// Max cumulative prompt tokens per turn
-    #[arg(long, default_value_t = 400_000, global = true)]
+    /// Max cumulative prompt tokens per turn (0 = no limit, the default; --max-steps and --max-time still apply)
+    #[arg(long, default_value_t = 0, global = true)]
     max_tokens: u64,
     /// Sandbox tier: landlock (default, tier 1), none (tier 0), warn (tier 1 or unconfined with a warning), container (tier 2)
     #[arg(long, value_enum, global = true)]
@@ -261,7 +261,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
     let ctx = Arc::new(tools::Ctx::with_sandbox(sandbox, net || mode == tools::Mode::None));
     let mut agent = Agent::new(client, ctx, AgentOpts {
         yes: auto, allow_outside: common.allow_outside || auto, guard, readonly: false, quiet: false, format: common.format,
-        limits: Limits { max_time, max_steps: common.max_steps, max_tokens: common.max_tokens }, small, thinking,
+        limits: Limits { max_time, max_steps: common.max_steps, max_tokens: agent::unlimited_tokens(common.max_tokens) }, small, thinking,
     });
     // session: explicit id > --continue (latest for this cwd) > new
     let sid = match (&common.session, common.cont) {

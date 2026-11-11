@@ -17,6 +17,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// `0` (the default of `--max-tokens` / `limits.max_tokens`) means no per-turn prompt-token budget: steps and time still bound a turn.
+pub fn unlimited_tokens(n: u64) -> u64 { if n == 0 { u64::MAX / 2 } else { n } }
+
 #[derive(Clone, Debug)]
 pub struct Limits {
     /// wall-clock per user turn
@@ -26,7 +29,7 @@ pub struct Limits {
     pub max_tokens: u64,
 }
 impl Default for Limits {
-    fn default() -> Self { Limits { max_time: None, max_steps: 60, max_tokens: 400_000 } }
+    fn default() -> Self { Limits { max_time: None, max_steps: 60, max_tokens: unlimited_tokens(0) } }
 }
 
 pub struct AgentOpts {
@@ -576,5 +579,16 @@ mod repair_tests {
         a.tool_calls = Some(vec![call("1")]);
         let (out, fixed) = repair_tool_calls(vec![a, Message::tool("1", "ok"), Message::text("assistant", "done")]);
         assert!(!fixed && out.len() == 3);
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    #[test]
+    fn zero_tokens_means_unlimited_and_explicit_values_are_kept() {
+        assert!(unlimited_tokens(0) > 1 << 60);
+        assert_eq!(unlimited_tokens(5000), 5000);
+        assert_eq!(Limits::default().max_tokens, unlimited_tokens(0));
     }
 }
