@@ -148,8 +148,12 @@ impl Agent {
     pub fn attach_session(&mut self, s: Session, resume: bool) {
         if resume {
             let stored: Vec<Message> = s.load().into_iter().filter(|m| m.role != "system").collect();
+            let (stored, repaired) = repair_tool_calls(stored);
             self.msgs.truncate(1);
             self.msgs.extend(stored);
+            self.session = Some(s);
+            if repaired { self.rewrite_session(); }
+            return;
         }
         self.session = Some(s);
     }
@@ -520,5 +524,57 @@ mod tests {
     fn repairs_trailing_junk() {
         assert_eq!(parse_args("{\"a\":1}}").unwrap()["a"], 1);
         assert!(parse_args("not json").is_err());
+    }
+}
+
+/// A process killed mid-tool leaves an assistant message whose tool calls have no results, which providers reject.
+/// Give each such call an error result so the conversation can continue. Returns whether anything was added.
+fn repair_tool_calls(msgs: Vec<Message>) -> (Vec<Message>, bool) {
+    let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
+    let mut fixed = false;
+    let mut i = 0;
+    while i < msgs.len() {
+        out.push(msgs[i].clone());
+        let calls = msgs[i].tool_calls.clone().unwrap_or_default();
+        i += 1;
+        if calls.is_empty() { continue; }
+        // keep the results that exist, then answer the calls that have none
+        let start = i;
+        while i < msgs.len() && msgs[i].role == "tool" { out.push(msgs[i].clone()); i += 1; }
+        for c in &calls {
+            if !msgs[start..i].iter().any(|n| n.tool_call_id.as_deref() == Some(c.id.as_str())) {
+                out.push(Message::tool(&c.id, "Error: interrupted (the process restarted before this tool finished; check its effect before retrying)"));
+                fixed = true;
+            }
+        }
+    }
+    (out, fixed)
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use crate::llm::{FnCall, ToolCall};
+
+    fn call(id: &str) -> ToolCall { ToolCall { id: id.into(), kind: "function".into(), function: FnCall { name: "bash".into(), arguments: "{}".into() } } }
+
+    #[test]
+    fn adds_results_for_unanswered_calls_only() {
+        let mut a = Message::text("assistant", "");
+        a.tool_calls = Some(vec![call("1"), call("2")]);
+        let (out, fixed) = repair_tool_calls(vec![Message::text("user", "go"), a, Message::tool("1", "ok")]);
+        assert!(fixed);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[2].tool_call_id.as_deref(), Some("1"));
+        assert_eq!(out[3].tool_call_id.as_deref(), Some("2"));
+        assert!(out[3].content.as_deref().unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn complete_history_is_untouched() {
+        let mut a = Message::text("assistant", "");
+        a.tool_calls = Some(vec![call("1")]);
+        let (out, fixed) = repair_tool_calls(vec![a, Message::tool("1", "ok"), Message::text("assistant", "done")]);
+        assert!(!fixed && out.len() == 3);
     }
 }

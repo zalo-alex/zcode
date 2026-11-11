@@ -90,7 +90,7 @@ pub async fn attach(name: String) -> anyhow::Result<i32> {
         format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed().to_string(),
         HELP.dimmed().to_string(),
     ];
-    interact(s, n, name, group, banner, false, i["thinking"].as_bool()).await
+    interact(s, n, name, group, banner, i["thinking"].as_bool(), None).await
 }
 
 pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
@@ -100,9 +100,11 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
         "policy": j.policy, "group": j.group, "max_workers": j.max_workers, "stream": true, "close_on_disconnect": true,
         "limits": {"max_time": j.max_time.unwrap_or(0), "max_steps": j.max_steps, "max_tokens": j.max_tokens}});
     if let Some(sid) = &j.session { create["session"] = json!(sid); }
-    call(&mut s, &mut n, "create", create).await.map_err(|e| {
+    let made = call(&mut s, &mut n, "create", create.clone()).await.map_err(|e| {
         if e.contains("already exists") { anyhow::anyhow!("{e}; pick another name with --agent") } else { anyhow::anyhow!("the daemon refused: {e}") }
     })?;
+    // after a daemon restart the same request (same session) brings the agent back
+    create["session"] = made["session"].clone();
     let built = match call(&mut s, &mut n, "build", json!({"instance": j.name})).await {
         Ok(b) => b,
         Err(e) => { let _ = call(&mut s, &mut n, "close", json!({"instance": j.name})).await; anyhow::bail!("{e}"); }
@@ -115,11 +117,14 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
         "your agent can message the others with send; what they send back shows up here as it arrives".dimmed().to_string(),
         HELP.dimmed().to_string(),
     ];
-    interact(s, n, j.name, j.group, banner, true, None).await
+    interact(s, n, j.name, j.group, banner, None, Some(create)).await
 }
 
-/// The prompt loop, shared by `run` and `attach`. `close` = end the instance on exit (the agent we created), else just detach.
-async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Vec<String>, close: bool, thinking: Option<bool>) -> anyhow::Result<i32> {
+/// The prompt loop, shared by `run` and `attach`. `recreate` (only for the agent we created) is its `create` request: it ends the
+/// instance on exit and brings it back after a daemon restart; without it the terminal just detaches.
+async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Vec<String>, thinking: Option<bool>, recreate: Option<Value>) -> anyhow::Result<i32> {
+    // an agent we created (recreate request known) is closed on exit; an attached one only detaches
+    let close = recreate.is_some();
     // keyboard: a thread (readline blocks), or plain lines when stdin is not a terminal
     let tty = std::io::stdin().is_terminal();
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Input>();
@@ -152,11 +157,11 @@ async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Ve
 
     for l in &banner { println!("{l}"); }
 
-    let (mut rd, wr) = s.into_split();
+    let (rd, wr) = s.into_split();
     let (fr_tx, mut fr_rx) = mpsc::unbounded_channel::<Value>();
-    tokio::spawn(async move { while let Ok(v) = read_frame(&mut rd).await { if fr_tx.send(v).is_err() { break; } } });
+    tokio::spawn(read_loop(rd, fr_tx));
 
-    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false, rbuf: String::new(), thinking, thinking_req: None };
+    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false, rbuf: String::new(), thinking, thinking_req: None, seq: 0 };
     let mut code = 0;
     loop {
         tokio::select! {
@@ -170,7 +175,24 @@ async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Ve
             },
             fr = fr_rx.recv() => match fr {
                 Some(v) => p.frame(&mut out, v).await,
-                None => { out.line(&"error: lost connection to the daemon".red()); code = 1; break; }
+                None => {
+                    out.line(&"daemon connection lost; waiting for it to come back...".yellow());
+                    match reconnect(&name, &recreate, p.seq, &mut p.n).await {
+                        Some(s) => {
+                            let (rd, wr) = s.into_split();
+                            let (tx, rx) = mpsc::unbounded_channel::<Value>();
+                            tokio::spawn(read_loop(rd, tx));
+                            (p.wr, fr_rx) = (wr, rx);
+                            // prompts the old connection never answered go out again; the restored agent may also be resuming by itself
+                            let mut lost: Vec<String> = p.prompts.drain().map(|(_, v)| v).collect();
+                            lost.reverse();
+                            for l in lost { p.pending.push_front(l); }
+                            p.busy = false;
+                            out.line(&"reconnected".green());
+                        }
+                        None => { out.line(&"error: lost connection to the daemon".red()); code = 1; break; }
+                    }
+                }
             },
         }
         // end of piped input: leave once the agent has nothing left to do
@@ -182,7 +204,31 @@ async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Ve
     Ok(code)
 }
 
+async fn read_loop(mut rd: tokio::net::unix::OwnedReadHalf, tx: mpsc::UnboundedSender<Value>) {
+    while let Ok(v) = read_frame(&mut rd).await { if tx.send(v).is_err() { break; } }
+}
+
+/// Wait for the daemon to come back (it restores its instances from disk), then take the instance back and
+/// replay the events after `since`. Gives up after about a minute.
+async fn reconnect(name: &str, recreate: &Option<Value>, since: u64, n: &mut u64) -> Option<UnixStream> {
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Ok(mut s) = connect(n).await else { continue };
+        if let Some(c) = recreate {
+            let mut c = c.clone();
+            c["reattach"] = json!(true);
+            if call(&mut s, n, "create", c).await.is_err() { continue; }
+        }
+        if call(&mut s, n, "build", json!({"instance": name})).await.is_err() { continue; }
+        if call(&mut s, n, "attach", json!({"instance": name, "since": since})).await.is_err() { continue; }
+        return Some(s);
+    }
+    None
+}
+
 struct Peer {
+    /// last event counter seen, to resume the stream after a reconnect
+    seq: u64,
     name: String,
     group: String,
     wr: OwnedWriteHalf,
@@ -260,6 +306,7 @@ impl Peer {
 
     /// A reply or an event from the daemon.
     async fn frame(&mut self, out: &mut Out, v: Value) {
+        if let Some(s) = v["seq"].as_u64() { self.seq = self.seq.max(s); }
         if let Some(id) = v["req"].as_u64() {
             if let Some(text) = self.prompts.remove(&id) {
                 if v["ok"] != true {

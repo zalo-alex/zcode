@@ -6,6 +6,7 @@ use crate::agent::{Agent, AgentOpts, Cancel, Limits, Stop};
 use crate::events;
 use crate::guard::GuardMode;
 use crate::llm::Client;
+use crate::persist;
 use crate::session::{self, Session};
 use crate::swarm::{Budget, SpawnCtx, Swarm, SwarmCfg};
 use crate::{config, context};
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 use zcode_tools::frames::{read_frame, write_frame};
 use zcode_tools::{self as tools, Mode, Policy, Sandbox};
 
@@ -85,6 +86,12 @@ struct Instance {
     buf: Mutex<EventBuf>,
     tx: broadcast::Sender<Value>,
     ring_cap: usize,
+    /// the (normalized) `create` request, kept for the restart manifest
+    req: Value,
+    /// something the restart manifest records changed; a background task writes it (debounced)
+    dirty: Arc<Notify>,
+    /// stop writing the manifest (the instance was closed, or the daemon is shutting down and keeps it)
+    frozen: AtomicBool,
 }
 
 fn valid_name(n: &str) -> bool { !n.is_empty() && n.len() <= 32 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') }
@@ -98,8 +105,21 @@ impl Instance {
         v["seq"] = json!(b.seq);
         if b.ring.len() >= self.ring_cap { b.ring.pop_front(); }
         b.ring.push_back(v.clone());
+        let seq = b.seq;
         drop(b);
+        if seq.is_multiple_of(50) || matches!(v["type"].as_str(), Some("spawn" | "idle" | "turn_end")) { self.dirty.notify_one(); }
         let _ = self.tx.send(v);
+    }
+
+    /// Write the restart manifest: the create request, workers, event counter and whether a turn is in flight.
+    fn save(&self) {
+        if self.frozen.load(Ordering::SeqCst) { return; }
+        let sw = self.swarm.lock().unwrap().clone();
+        let workers = sw.map(|s| s.workers_of(&self.name)).unwrap_or_default();
+        persist::save(&self.app, &self.name, &json!({
+            "app": self.app, "name": self.name, "req": self.req, "thinking": self.thinking.load(Ordering::SeqCst),
+            "running": self.running.load(Ordering::SeqCst), "seq": self.buf.lock().unwrap().seq, "workers": workers,
+        }));
     }
 
     fn sink(self: &Arc<Self>) -> events::Sink {
@@ -168,7 +188,7 @@ impl Daemon {
         agent.gate = Some(self.gate.clone());
         agent.global = Some(self.global.clone());
         agent.cancel = inst.cancel.clone();
-        agent.attach_session(Session::open_or_create(Some(&p.session), &p.cwd, &settings.main.model).map_err(|e| e.to_string())?, false);
+        agent.attach_session(Session::open_or_create(Some(&p.session), &p.cwd, &settings.main.model).map_err(|e| e.to_string())?, true);
         let sc = || SpawnCtx { client: client.clone(), small: small.clone(), raw: p.config.clone(), policy: policy.clone(), mode: p.mode, auto: true, require: p.require_sandbox,
             session_base: p.session.clone(), model: settings.main.model.clone(), lead_tier: sandbox.tier(), idmap_full: false, limits: p.limits.clone(), format: events::Format::Json };
         let g = |k: &str, d: u64| p.swarm.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
@@ -223,6 +243,7 @@ impl Daemon {
     fn start_turn(self: &Arc<Self>, inst: &Arc<Instance>, input: String) -> Result<(), String> {
         if inst.crashed.load(Ordering::SeqCst) { return Err("instance crashed earlier; close it and create a new one".into()); }
         if inst.running.swap(true, Ordering::SeqCst) { return Err("instance is busy".into()); }
+        inst.dirty.notify_one();
         let Some(mut agent) = inst.agent.lock().unwrap().take() else { inst.running.store(false, Ordering::SeqCst); return Err("instance is not ready".into()) };
         agent.thinking = inst.thinking.load(Ordering::SeqCst);
         let cap = self.cfg.max_history_bytes;
@@ -258,25 +279,138 @@ impl Daemon {
                 }
             }
             inst2.running.store(false, Ordering::SeqCst);
+            inst2.dirty.notify_one();
         });
         Ok(())
     }
 
     async fn close_instance(&self, app: &str, name: &str) -> Result<(), String> {
         let inst = self.instances.lock().unwrap().remove(&Self::ns(app, name)).ok_or_else(|| format!("no such instance `{name}`"))?;
+        inst.frozen.store(true, Ordering::SeqCst);
+        persist::remove(app, name);
+        self.teardown(&inst).await;
+        Ok(())
+    }
+
+    /// Stop an instance's agent, workers and sandbox. The restart manifest is not touched here.
+    async fn teardown(&self, inst: &Arc<Instance>) {
         inst.cancel.cancel();
         let sw = inst.swarm.lock().unwrap().take();
         if let Some(sw) = sw {
             sw.remove_root(&inst.name, inst.p.sandbox_of.is_none()).await;
             if let Some(g) = &inst.p.group {
-                let key = Self::ns(app, g);
+                let key = Self::ns(&inst.app, g);
                 if !sw.has_roots() { self.groups.lock().unwrap().remove(&key); }
             }
         }
         let sb = inst.sandbox.lock().unwrap().take();
         if let (Some(sb), None) = (sb, &inst.p.sandbox_of) { sb.close().await; } // a shared sandbox belongs to its source instance
         inst.push_event(json!({"type": "closed"}));
-        Ok(())
+    }
+
+    /// Daemon stop: write every manifest first (with the turns that are in flight right now), then tear down and keep them.
+    async fn shutdown(&self) {
+        let all: Vec<Arc<Instance>> = self.instances.lock().unwrap().values().cloned().collect();
+        for i in &all { i.save(); i.frozen.store(true, Ordering::SeqCst); }
+        for i in &all { self.teardown(i).await; }
+    }
+
+    /// Validate a `create` request and register the instance. `seq`/`thinking` come from a manifest when restoring.
+    fn make_instance(&self, app: &str, req: &Value, seq: u64) -> Result<Arc<Instance>, String> {
+        let name = str_of(req, "instance")?;
+        if !valid_name(name) { return Err("instance must be [A-Za-z0-9_-]{1,32}".into()); }
+        if let Some(src) = req["sandbox_of"].as_str() { self.find(app, src)?; }
+        let cwd = PathBuf::from(str_of(req, "cwd")?);
+        if !cwd.is_absolute() || !cwd.is_dir() { return Err("cwd must be an existing absolute directory".into()); }
+        let cwd = cwd.canonicalize().map_err(|e| e.to_string())?;
+        if !req["config"].is_object() { return Err("create needs a `config` object with provider and model (the daemon never uses its own credentials)".into()); }
+        let mode = match req["sandbox"].as_str().unwrap_or("landlock") {
+            "none" => Mode::None, "landlock" => Mode::Landlock, "warn" => Mode::Warn, "container" => Mode::Container,
+            o => return Err(format!("sandbox must be none|landlock|warn|container, got `{o}`")),
+        };
+        let l = &req["limits"];
+        let limits = Limits { max_time: l["max_time"].as_u64().filter(|n| *n > 0).map(Duration::from_secs), max_steps: l["max_steps"].as_u64().unwrap_or(60) as usize, max_tokens: l["max_tokens"].as_u64().unwrap_or(400_000) };
+        let session = req["session"].as_str().map(String::from).unwrap_or_else(session::new_id);
+        let mut map = self.instances.lock().unwrap();
+        if map.len() >= self.cfg.max_instances { return Err(format!("instance limit reached ({})", self.cfg.max_instances)); }
+        let key = Self::ns(app, name);
+        if map.contains_key(&key) { return Err(format!("instance `{name}` already exists")); }
+        let (btx, _) = broadcast::channel(1024);
+        let group = req["group"].as_str().map(String::from);
+        if group.as_ref().is_some_and(|g| !valid_name(g)) { return Err("invalid group name".into()); }
+        let mut stored = req.clone();
+        stored["session"] = json!(session);
+        let inst = Arc::new(Instance {
+            name: name.to_string(), app: app.to_string(),
+            p: Params { cwd, config: req["config"].clone(), model: req["model"].as_str().map(String::from), mode, require_sandbox: req["require_sandbox"].as_bool().unwrap_or(false),
+                policy: req["policy"].clone(), limits, group, max_workers: req["max_workers"].as_u64().unwrap_or(0) as usize, stream: req["stream"].as_bool().unwrap_or(false),
+                session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from) },
+            agent: Mutex::new(None), build: tokio::sync::Mutex::new(false), running: AtomicBool::new(false), crashed: AtomicBool::new(false),
+            swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), thinking: AtomicBool::new(req["thinking"].as_bool().unwrap_or(false)),
+            buf: Mutex::new(EventBuf { ring: VecDeque::new(), seq }), tx: btx, ring_cap: self.cfg.ring,
+            req: stored, dirty: Arc::new(Notify::new()), frozen: AtomicBool::new(false),
+        });
+        map.insert(key, inst.clone());
+        drop(map);
+        // debounced manifest writer; ends with the instance
+        let (w, n) = (Arc::downgrade(&inst), inst.dirty.clone());
+        tokio::spawn(async move {
+            loop {
+                n.notified().await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                match w.upgrade() { Some(i) if !i.frozen.load(Ordering::SeqCst) => i.save(), _ => break }
+            }
+        });
+        inst.save();
+        Ok(inst)
+    }
+
+    /// After a daemon restart: recreate every instance from its manifest. Allocation is immediate (clients can reattach
+    /// right away); the rebuild of agents, containers and workers runs in the background and re-wakes interrupted turns.
+    fn restore(self: &Arc<Self>) -> usize {
+        let mut todo: Vec<(Arc<Instance>, Value)> = vec![];
+        for m in persist::load_all() {
+            let (app, name) = (m["app"].as_str().unwrap_or("").to_string(), m["name"].as_str().unwrap_or("").to_string());
+            let mut req = m["req"].clone();
+            req["thinking"] = m["thinking"].clone();
+            // the counter may be a little behind the last event a client saw: skip ahead so its `since` cursor stays valid
+            match self.make_instance(&app, &req, m["seq"].as_u64().unwrap_or(0) + 100) {
+                Ok(i) => todo.push((i, m)),
+                Err(e) => eprintln!("zcode daemon: cannot restore instance `{app}/{name}`: {e}"),
+            }
+        }
+        let n = todo.len();
+        let d = self.clone();
+        tokio::spawn(async move {
+            let mut wake = vec![];
+            for (inst, m) in todo {
+                let workers = m["workers"].as_array().cloned().unwrap_or_default();
+                let running = m["running"].as_bool() == Some(true);
+                inst.push_event(json!({"type": "restored", "running": running, "workers": workers.len()}));
+                // instances that must be on the bus (group, workers) or were mid-turn are rebuilt now; the others on first use
+                if !(inst.p.group.is_some() || inst.p.max_workers > 0 || running || !workers.is_empty()) { continue; }
+                if let Err(e) = d.ensure_built(&inst).await {
+                    inst.push_event(json!({"type": "warning", "message": format!("restore failed: {e}")}));
+                    continue;
+                }
+                let sw = inst.swarm.lock().unwrap().clone();
+                if let Some(sw) = sw {
+                    let sink = inst.sink();
+                    for w in &workers {
+                        if let Err(e) = events::SINK.scope(sink.clone(), sw.respawn(&inst.name, w)).await {
+                            inst.push_event(json!({"type": "warning", "message": format!("cannot restore worker `{}`: {e}", w["name"].as_str().unwrap_or("?"))}));
+                        }
+                    }
+                }
+                if running { wake.push(inst); }
+            }
+            // every group member is back on the bus before anyone is woken
+            for inst in wake {
+                let msg = "[system] The daemon restarted while you were working: your sandbox was recreated (running processes ended; files in the project are kept). Check the state of your task and continue it.";
+                if let Err(e) = d.start_turn(&inst, msg.into()) { inst.push_event(json!({"type": "warning", "message": format!("cannot resume the interrupted turn: {e}")})); }
+            }
+        });
+        n
     }
 }
 
@@ -327,36 +461,12 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
     match op {
         "create" => {
             let name = str_of(req, "instance")?;
-            if !valid_name(name) { return Err("instance must be [A-Za-z0-9_-]{1,32}".into()); }
-            if let Some(src) = req["sandbox_of"].as_str() { d.find(app, src)?; }
-            let cwd = PathBuf::from(str_of(req, "cwd")?);
-            if !cwd.is_absolute() || !cwd.is_dir() { return Err("cwd must be an existing absolute directory".into()); }
-            let cwd = cwd.canonicalize().map_err(|e| e.to_string())?;
-            if !req["config"].is_object() { return Err("create needs a `config` object with provider and model (the daemon never uses its own credentials)".into()); }
-            let mode = match req["sandbox"].as_str().unwrap_or("landlock") {
-                "none" => Mode::None, "landlock" => Mode::Landlock, "warn" => Mode::Warn, "container" => Mode::Container,
-                o => return Err(format!("sandbox must be none|landlock|warn|container, got `{o}`")),
-            };
-            let l = &req["limits"];
-            let limits = Limits { max_time: l["max_time"].as_u64().filter(|n| *n > 0).map(Duration::from_secs), max_steps: l["max_steps"].as_u64().unwrap_or(60) as usize, max_tokens: l["max_tokens"].as_u64().unwrap_or(400_000) };
-            let session = req["session"].as_str().map(String::from).unwrap_or_else(session::new_id);
-            let mut map = d.instances.lock().unwrap();
-            if map.len() >= d.cfg.max_instances { return Err(format!("instance limit reached ({})", d.cfg.max_instances)); }
-            let key = Daemon::ns(app, name);
-            if map.contains_key(&key) { return Err(format!("instance `{name}` already exists")); }
-            let (btx, _) = broadcast::channel(1024);
-            let group = req["group"].as_str().map(String::from);
-            if group.as_ref().is_some_and(|g| !valid_name(g)) { return Err("invalid group name".into()); }
-            let inst = Arc::new(Instance {
-                name: name.to_string(), app: app.to_string(),
-                p: Params { cwd, config: req["config"].clone(), model: req["model"].as_str().map(String::from), mode, require_sandbox: req["require_sandbox"].as_bool().unwrap_or(false),
-                    policy: req["policy"].clone(), limits, group, max_workers: req["max_workers"].as_u64().unwrap_or(0) as usize, stream: req["stream"].as_bool().unwrap_or(false),
-                    session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from) },
-                agent: Mutex::new(None), build: tokio::sync::Mutex::new(false), running: AtomicBool::new(false), crashed: AtomicBool::new(false),
-                swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), thinking: AtomicBool::new(req["thinking"].as_bool().unwrap_or(false)), buf: Mutex::new(EventBuf::default()), tx: btx, ring_cap: d.cfg.ring,
-            });
-            map.insert(key, inst);
-            Ok(json!({"instance": name, "session": session}))
+            // a client that lost its connection (daemon restart) takes its instance back instead of creating it again
+            if req["reattach"].as_bool() == Some(true) && let Ok(i) = d.find(app, name) {
+                return Ok(json!({"instance": name, "session": i.p.session, "events": i.buf.lock().unwrap().seq, "reattached": true}));
+            }
+            let inst = d.make_instance(app, req, 0)?;
+            Ok(json!({"instance": name, "session": inst.p.session}))
         }
         "attach" => {
             let inst = d.find(app, str_of(req, "instance")?)?;
@@ -494,6 +604,8 @@ pub async fn run() -> anyhow::Result<i32> {
     if cfg!(panic = "abort") {
         eprintln!("note: built with panic=abort: a panic inside one instance will stop the whole daemon; build with `cargo build --profile serve` for per-instance panic isolation");
     }
+    let restored = d.restore();
+    if restored > 0 { eprintln!("zcode daemon: restoring {restored} instance(s) from {}", persist::dir().display()); }
     eprintln!("zcode daemon listening on {}", path.display());
     loop {
         tokio::select! {
@@ -506,8 +618,7 @@ pub async fn run() -> anyhow::Result<i32> {
             _ = sigterm() => break,
         }
     }
-    let names: Vec<(String, String)> = d.instances.lock().unwrap().values().map(|i| (i.app.clone(), i.name.clone())).collect();
-    for (a, n) in names { let _ = d.close_instance(&a, &n).await; }
+    d.shutdown().await;
     let _ = std::fs::remove_file(&path);
     Ok(0)
 }

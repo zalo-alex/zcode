@@ -92,6 +92,8 @@ struct Entry {
     tin: u64,
     tout: u64,
     write: Vec<PathBuf>,
+    /// `{prompt, write, profile}` of a worker (to respawn it after a daemon restart)
+    spawn: Value,
 }
 
 #[derive(Default)]
@@ -173,7 +175,7 @@ impl Swarm {
             auto: sc.auto, require: sc.require, session_base: sc.session_base.clone(), model: sc.model.clone(), lead_tier: sc.lead_tier, idmap_full: sc.idmap_full,
             limits: sc.limits.clone(), format: sc.format });
         st.agents.insert(root.into(), Entry { ctx: sc_arc, tx, status: Status::Running, queued: 0, parent: None, tier: lead_sandbox.tier(), sandbox: lead_sandbox,
-            handle: None, steps: 0, tin: 0, tout: 0, write: vec![] });
+            handle: None, steps: 0, tin: 0, tout: 0, write: vec![], spawn: Value::Null });
         let sw = Swarm { st: Mutex::new(st), sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))), budget: Budget::new(&if cfg.unbounded { Limits { max_time: None, max_steps: usize::MAX / 2, max_tokens: u64::MAX / 2 } } else { sc.limits.clone() }), cfg, notify: Notify::new(),
             next_id: AtomicU64::new(1), sc, print: Mutex::new(()) };
         (Arc::new(sw), rx)
@@ -186,7 +188,7 @@ impl Swarm {
         if st.agents.contains_key(name) { return Err(format!("agent `{name}` already exists in this group")); }
         let (tx, rx) = mpsc::unbounded_channel();
         st.agents.insert(name.into(), Entry { ctx: Arc::new(sc), tx, status: Status::Running, queued: 0, parent: None, tier: sandbox.tier(), sandbox,
-            handle: None, steps: 0, tin: 0, tout: 0, write: vec![] });
+            handle: None, steps: 0, tin: 0, tout: 0, write: vec![], spawn: Value::Null });
         Ok(rx)
     }
 
@@ -365,6 +367,25 @@ impl Swarm {
     }
 
     pub async fn spawn(self: &Arc<Self>, parent: &str, name: &str, prompt: &str, write: &[String], profile: Option<&str>) -> Result<String, String> {
+        self.spawn_inner(parent, name, prompt, write, profile, None).await
+    }
+
+    /// Workers of `root` as `[{name, status, prompt, write, profile}]`, for the daemon's restart manifest.
+    pub fn workers_of(&self, root: &str) -> Vec<Value> {
+        let st = self.st.lock().unwrap();
+        st.agents.iter().filter(|(_, a)| a.parent.as_deref() == Some(root))
+            .map(|(k, a)| { let mut v = a.spawn.clone(); v["name"] = json!(k); v["status"] = json!(a.status.name()); v }).collect()
+    }
+
+    /// Bring a worker back after a daemon restart: its session is resumed and its sandbox recreated.
+    /// A worker that was mid-task is told to continue; an idle one waits for its next message.
+    pub async fn respawn(self: &Arc<Self>, parent: &str, w: &Value) -> Result<String, String> {
+        let write: Vec<String> = w["write"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        let active = w["status"].as_str() != Some("idle");
+        self.spawn_inner(parent, w["name"].as_str().unwrap_or(""), w["prompt"].as_str().unwrap_or(""), &write, w["profile"].as_str(), Some(active)).await
+    }
+
+    async fn spawn_inner(self: &Arc<Self>, parent: &str, name: &str, prompt: &str, write: &[String], profile: Option<&str>, resume: Option<bool>) -> Result<String, String> {
         if !valid_name(name) { return Err(format!("invalid agent name `{name}` (letters, digits, _ and -; not `lead`)")); }
         {
             let st = self.st.lock().unwrap();
@@ -427,7 +448,7 @@ impl Swarm {
             small: sc.small.clone(), thinking: false,
         });
         let sess = Session::open_worker(&sc.session_base, name, &root, &sc.model).map_err(|e| e.to_string())?;
-        agent.attach_session(sess, false);
+        agent.attach_session(sess, resume.is_some());
         if cap.0.is_some() || cap.1.is_some() { agent.cap = Some(cap); }
         let (tx, rx) = mpsc::unbounded_channel();
         agent.become_worker(name, 1, self.clone(), rx, parent);
@@ -435,7 +456,8 @@ impl Swarm {
             let mut st = self.st.lock().unwrap();
             if st.agents.contains_key(name) { return Err(format!("agent `{name}` already exists")); }
             st.agents.insert(name.to_string(), Entry { ctx: sc.clone(), tx, status: Status::Running, queued: 0, parent: Some(parent.into()), tier: sandbox.tier(), sandbox: sandbox.clone(),
-                handle: None, steps: 0, tin: 0, tout: 0, write: wpaths });
+                handle: None, steps: 0, tin: 0, tout: 0, write: wpaths,
+                spawn: json!({"prompt": prompt, "write": write, "profile": profile}) });
         }
         self.ev("spawn", json!({"agent": name, "parent": parent, "tier": sandbox.tier().n(), "write": write, "profile": profile}));
         if sandbox.tier() == Tier::Container {
@@ -449,7 +471,11 @@ impl Swarm {
             };
             tokio::spawn(async move { match sink { Some(s) => events::SINK.scope(s, job).await, None => job.await } });
         }
-        let first = format!("[from {parent}] {prompt}");
+        let first = match resume {
+            None => Some(format!("[from {parent}] {prompt}")),
+            Some(true) => Some("[system] The daemon restarted: your sandbox was recreated (running processes ended; files in the project and your write paths are kept). Check the state of your task and continue it.".to_string()),
+            Some(false) => None,
+        };
         let sw = self.clone();
         let nm = name.to_string();
         let sink = events::current_sink();
@@ -464,8 +490,15 @@ impl Swarm {
 
 fn snippet(t: &str) -> String { t.chars().take(200).collect() }
 
-async fn worker_loop(mut agent: Agent, sw: Arc<Swarm>, name: String, first: String) {
-    let mut input = first;
+async fn worker_loop(mut agent: Agent, sw: Arc<Swarm>, name: String, first: Option<String>) {
+    let mut input = match first {
+        Some(f) => f,
+        None => {
+            // restored idle worker: park until a message arrives
+            sw.set_status(&name, Status::Idle);
+            match agent.recv_blocking().await { Some(m) => format!("[from {}] {}", m.from, m.text), None => return }
+        }
+    };
     loop {
         let res = agent.turn(&input).await;
         let text = match res {

@@ -6,6 +6,7 @@ mod events;
 mod guard;
 mod llm;
 mod peer;
+mod persist;
 mod permission;
 mod prompt;
 mod repl;
