@@ -1,6 +1,6 @@
 [package]
 name = "zcode-tools"
-version = "0.3.0"
+version = "0.3.3"
 edition = "2024"
 description = "zcode tool implementations and the Sandbox abstraction"
 license = "MIT"

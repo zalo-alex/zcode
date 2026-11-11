@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "zcode"
-version = "0.3.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-guest"
-version = "0.3.0"
+version = "0.3.3"
 dependencies = [
  "libc",
  "serde_json",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-tools"
-version = "0.3.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "flate2",
