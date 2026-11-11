@@ -1,6 +1,6 @@
 # Tier 2: one rootless container per agent
 
-`--sandbox container` (or a profile with `"sandbox": "container"`) runs **all tools of an agent inside its own rootless OCI container**: own root filesystem, own PID/IPC/UTS/mount/net namespaces. `webfetch` stays host-side, gated by the agent's `net` policy. Nothing from the host is visible except the project directory.
+`--sandbox container` (or a profile with `"sandbox": "container"`) runs **all tools of an agent inside its own rootless OCI container**: own root filesystem, own PID/IPC/UTS/mount/net namespaces. `webfetch` and `websearch` stay host-side, gated by the agent's `net` policy. Nothing from the host is visible except the project directory.
 
 ## Requirements (checked lazily at the first tier 2 start, cached; fail closed)
 

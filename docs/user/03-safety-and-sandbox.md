@@ -67,7 +67,7 @@ Result:
 PermissionError: [Errno 1] Operation not permitted
 ```
 
-Add `--net` when a task needs it (installing packages, calling an API, `git clone`, the `webfetch` tool):
+Add `--net` when a task needs it (installing packages, calling an API, `git clone`, the `webfetch` and `websearch` tools):
 
 ```text
 $ zcode run --auto --net "can you reach the internet?"

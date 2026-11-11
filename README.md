@@ -130,6 +130,7 @@ Any OpenAI-compatible `/chat/completions` endpoint with streaming and tool calls
 | `bash` | Persistent working directory, timeouts, process-group kill, **background jobs** |
 | `bash_output` `bash_kill` | Read and stop background jobs (dev servers, watchers) |
 | `webfetch` | Fetch a URL as clean text |
+| `websearch` | Search the web (Exa, no API key); needs `--net` |
 | `task` | Read-only sub-agent for exploration |
 | `todowrite` `todoread` | Plan and track multi-step work |
 

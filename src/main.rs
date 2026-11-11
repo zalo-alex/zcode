@@ -131,7 +131,7 @@ struct Common {
     /// Extra read-write path for the sandbox (repeatable)
     #[arg(long = "allow-write", global = true)]
     allow_write: Vec<std::path::PathBuf>,
-    /// Allow network access (bash sockets, webfetch); default off under the sandbox
+    /// Allow network access (bash sockets, webfetch, websearch); default off under the sandbox
     #[arg(long, global = true)]
     net: bool,
     /// Enable the swarm: the lead may spawn up to N workers (0 = off, default; config `swarm.max_workers`)

@@ -42,7 +42,7 @@ use std::time::Duration;
 
 pub struct Ctx {
     pub sandbox: Arc<dyn Sandbox>,
-    /// `webfetch` is host-side; gated by the agent's net policy
+    /// `webfetch`/`websearch` are host-side; gated by the agent's net policy
     pub net: bool,
     pub todos: Mutex<Vec<(String, String)>>, // (status, content)
 }
@@ -99,6 +99,9 @@ pub const SPECS: &[Spec] = &[
     Spec { name: "webfetch", readonly: true,
         desc: "Fetch a URL and return text content (HTML stripped).",
         params: || obj(json!({"url":{"type":"string"}}), &["url"]) },
+    Spec { name: "websearch", readonly: true,
+        desc: "Search the web (Exa) and return relevant page contents. Use for current information beyond the codebase and training data.",
+        params: || obj(json!({"query":{"type":"string","description":"search query"},"numResults":{"type":"integer","description":"number of results (default 8)"},"livecrawl":{"type":"string","enum":["fallback","preferred"],"description":"fallback: live crawl only if no cache (default); preferred: prioritize live crawling"},"type":{"type":"string","enum":["auto","fast","deep"],"description":"auto (default), fast, or deep search"},"contextMaxCharacters":{"type":"integer","description":"max characters of context returned"}}), &["query"]) },
     Spec { name: "task", readonly: true,
         desc: "Delegate a self-contained research/exploration job to a sub-agent with read-only tools. Returns its final report. Use for broad codebase searches.",
         params: || obj(json!({"prompt":{"type":"string","description":"complete instructions, sub-agent has no other context"}}), &["prompt"]) },
@@ -161,6 +164,13 @@ pub async fn run(name: &str, args: &Value, ctx: &Ctx) -> Result<String> {
             { web::fetch(args).await? }
             #[cfg(not(feature = "web"))]
             { bail!("webfetch is not built in") }
+        }
+        "websearch" => {
+            if !ctx.net { bail!("network is disabled by the sandbox policy (start zcode with --net)"); }
+            #[cfg(feature = "web")]
+            { web::search(args).await? }
+            #[cfg(not(feature = "web"))]
+            { bail!("websearch is not built in") }
         }
         "task" => return Err(anyhow!("task handled by agent")),
         _ => return Err(anyhow!("unknown tool `{name}`")),
@@ -325,6 +335,15 @@ mod tests {
         let ctx = Ctx::new(tmp("spill"));
         let o = run("bash", &json!({"command":"seq 1 20000"}), &ctx).await.unwrap();
         assert!(o.contains("truncated") && o.contains("full output saved to"), "{}", &o[o.len().saturating_sub(200)..]);
+    }
+
+    #[tokio::test]
+    async fn websearch_needs_net() {
+        let mut ctx = Ctx::new(tmp("wsearch"));
+        ctx.net = false;
+        let e = run("websearch", &json!({"query":"x"}), &ctx).await.unwrap_err();
+        assert!(e.to_string().contains("--net"));
+        assert!(is_readonly("websearch"));
     }
 
     #[tokio::test]
