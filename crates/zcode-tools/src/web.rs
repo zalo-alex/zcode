@@ -46,8 +46,10 @@ pub fn parse_response(body: &str) -> Result<String> {
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str(d.trim()).ok())
         .collect();
-    if msgs.is_empty() {
-        if let Ok(v) = serde_json::from_str::<Value>(body.trim()) { msgs.push(v); }
+    if msgs.is_empty()
+        && let Ok(v) = serde_json::from_str::<Value>(body.trim())
+    {
+        msgs.push(v);
     }
     for m in &msgs {
         if let Some(e) = m["error"]["message"].as_str() { bail!("search error: {e}"); }

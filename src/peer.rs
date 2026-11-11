@@ -86,9 +86,9 @@ pub async fn attach(name: String) -> anyhow::Result<i32> {
     let group = i["group"].as_str().unwrap_or("").to_string();
     let banner = vec![
         format!("{} {} · {}", "zcode".bold().cyan(), env!("CARGO_PKG_VERSION"), i["cwd"].as_str().unwrap_or("")),
-        format!("{}", format!("attached to `{name}`{} · auto-approve · leaving detaches, the agent keeps running", if group.is_empty() { String::new() } else { format!(" (group `{group}`)") }).dimmed()),
-        format!("{}", format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed()),
-        format!("{}", HELP.dimmed()),
+        format!("attached to `{name}`{} · auto-approve · leaving detaches, the agent keeps running", if group.is_empty() { String::new() } else { format!(" (group `{group}`)") }).dimmed().to_string(),
+        format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed().to_string(),
+        HELP.dimmed().to_string(),
     ];
     interact(s, n, name, group, banner, false, i["thinking"].as_bool()).await
 }
@@ -110,10 +110,10 @@ pub async fn run(j: Join<'_>) -> anyhow::Result<i32> {
     call(&mut s, &mut n, "attach", json!({"instance": j.name})).await.map_err(anyhow::Error::msg)?;
     let banner = vec![
         format!("{} {} · {} · {}", "zcode".bold().cyan(), env!("CARGO_PKG_VERSION"), j.settings.main.model, j.cwd.display()),
-        format!("{}", format!("joined group `{}` as `{}` · auto-approve · sandbox {}", j.group, j.name, j.sandbox).dimmed()),
-        format!("{}", format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed()),
-        format!("{}", "your agent can message the others with send; what they send back shows up here as it arrives".dimmed()),
-        format!("{}", HELP.dimmed()),
+        format!("joined group `{}` as `{}` · auto-approve · sandbox {}", j.group, j.name, j.sandbox).dimmed().to_string(),
+        format!("in the group: {}", names(&built["agents"]).join(", ")).dimmed().to_string(),
+        "your agent can message the others with send; what they send back shows up here as it arrives".dimmed().to_string(),
+        HELP.dimmed().to_string(),
     ];
     interact(s, n, j.name, j.group, banner, true, None).await
 }
