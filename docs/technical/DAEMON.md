@@ -34,7 +34,7 @@ Config (`serve` key of the daemon's own config): `max_instances` (64), `max_hist
 | `thinking` | `instance`, `on?` | show/hide the model's reasoning for the instance from its next turn; without `on` it only reports `{thinking}`. `status` includes `thinking` too |
 | `cancel` | `instance` | interrupts the running turn (`turn_end` with `stop: "interrupted"`) |
 | `close` | `instance` | stops workers, closes sandboxes/containers, forgets the instance |
-| `status` | `instance?` | state, queue, per-agent budgets (as `/agents`); per instance also `pid` (host pid of the tier 2 container init, for `nsenter`) and `ports` (`[{guest, host}]`) |
+| `status` | `instance?` | state, queue, per-agent budgets (as `/agents`); per instance also `pid` (host pid of the tier 2 container init, for `nsenter`) and `ports` (`[{guest, host}]`), `turn` (`null` when idle, else `{since, step, tool}`: `since` = ms when the turn began, `step` = `step_start`s seen this turn (0 before the first), `tool` = name of the tool executing now, the latest started one when several run in parallel, else `null`), `queued` (messages for this agent not yet read; always 0 without a swarm) and `last_event_ts` (`timestamp` of its newest event, `null` if it has none). `running`, `events`, `thinking`, ... are unchanged |
 
 ## Interactive agents in a group (`zcode --group`)
 

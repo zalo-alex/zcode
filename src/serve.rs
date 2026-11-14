@@ -64,10 +64,24 @@ struct Params {
     sandbox_of: Option<String>,
 }
 
+/// What the lead's turn is doing right now, kept up to date from the events it emits (for `status` and `attach` catch-up).
+#[derive(Default)]
+struct Live {
+    /// ms since the epoch when the turn began; `None` while idle
+    since: Option<u64>,
+    /// `step_start` events seen this turn
+    step: u32,
+    /// tool calls of the current step that were started and have no `tool_use` yet: (callID, tool, summary)
+    running: Vec<(String, String, String)>,
+}
+
 #[derive(Default)]
 struct EventBuf {
     ring: VecDeque<Value>,
     seq: u64,
+    /// `timestamp` of the newest event
+    last_ts: u64,
+    live: Live,
 }
 
 struct Instance {
@@ -105,6 +119,18 @@ impl Instance {
         let mut b = self.buf.lock().unwrap();
         b.seq += 1;
         v["seq"] = json!(b.seq);
+        b.last_ts = v["timestamp"].as_u64().unwrap_or(0);
+        if b.live.since.is_some() && v["agent"] == self.name.as_str() {
+            match v["type"].as_str() {
+                Some("step_start") => { b.live.step += 1; b.live.running.clear(); }
+                Some("tool_start") => {
+                    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+                    b.live.running.push((s("callID"), s("tool"), s("summary")));
+                }
+                Some("tool_use") => { let id = v["part"]["callID"].as_str().unwrap_or(""); b.live.running.retain(|r| r.0 != id); }
+                _ => {}
+            }
+        }
         if b.ring.len() >= self.ring_cap { b.ring.pop_front(); }
         b.ring.push_back(v.clone());
         let seq = b.seq;
@@ -251,6 +277,7 @@ impl Daemon {
         if inst.running.swap(true, Ordering::SeqCst) { return Err("instance is busy".into()); }
         inst.dirty.notify_one();
         let Some(mut agent) = inst.agent.lock().unwrap().take() else { inst.running.store(false, Ordering::SeqCst); return Err("instance is not ready".into()) };
+        inst.buf.lock().unwrap().live = Live { since: Some(events::now_ms()), ..Live::default() };
         // in the ring before the turn's first step_start, so replays and late attachers see what was asked
         if let Some(src) = source { inst.push_event(json!({"type": "user", "timestamp": events::now_ms(), "agent": inst.name, "text": input, "source": src})); }
         agent.thinking = inst.thinking.load(Ordering::SeqCst);
@@ -286,6 +313,7 @@ impl Daemon {
                     inst2.push_event(json!({"type": "turn_end", "agent": inst2.name, "stop": "error", "code": 1, "message": "instance panicked", "text": ""}));
                 }
             }
+            inst2.buf.lock().unwrap().live = Live::default();
             inst2.running.store(false, Ordering::SeqCst);
             inst2.dirty.notify_one();
         });
@@ -355,7 +383,7 @@ impl Daemon {
                 session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from) },
             agent: Mutex::new(None), build: tokio::sync::Mutex::new(false), running: AtomicBool::new(false), crashed: AtomicBool::new(false),
             swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), thinking: AtomicBool::new(req["thinking"].as_bool().unwrap_or(false)),
-            buf: Mutex::new(EventBuf { ring: VecDeque::new(), seq }), tx: btx, ring_cap: self.cfg.ring,
+            buf: Mutex::new(EventBuf { seq, ..EventBuf::default() }), tx: btx, ring_cap: self.cfg.ring,
             req: stored, dirty: Arc::new(Notify::new()), frozen: AtomicBool::new(false),
         });
         map.insert(key, inst.clone());
@@ -571,9 +599,16 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             };
             let items: Vec<Value> = list.iter().map(|i| {
                 let sw = i.swarm.lock().unwrap().clone();
+                // one lock for a consistent view of the turn and the newest event
+                let (turn, last_ts) = {
+                    let b = i.buf.lock().unwrap();
+                    let turn = b.live.since.map(|since| json!({"since": since, "step": b.live.step, "tool": b.live.running.last().map(|r| r.1.clone())}));
+                    (turn, if b.seq == 0 { None } else { Some(b.last_ts) })
+                };
                 json!({"instance": i.name, "cwd": i.p.cwd, "group": i.p.group, "running": i.running.load(Ordering::SeqCst), "crashed": i.crashed.load(Ordering::SeqCst),
                     "built": i.agent.lock().unwrap().is_some() || i.running.load(Ordering::SeqCst), "events": i.buf.lock().unwrap().seq,
                     "thinking": i.thinking.load(Ordering::SeqCst),
+                    "turn": turn, "queued": sw.as_ref().map(|s| s.queued(&i.name)).unwrap_or(0), "last_event_ts": last_ts,
                     "pid": i.sandbox.lock().unwrap().as_ref().and_then(|s| s.init_pid()),
                     "ports": i.sandbox.lock().unwrap().as_ref().map(|s| s.ports().iter().map(|(g, h)| json!({"guest": g, "host": h})).collect::<Vec<_>>()).unwrap_or_default(),
                     "agents": sw.map(|s| s.list()).unwrap_or_default()})

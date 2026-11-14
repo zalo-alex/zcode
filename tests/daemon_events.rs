@@ -6,6 +6,7 @@ use dm::*;
 use serde_json::{Value, json};
 
 fn text(s: &str) -> Script { Script::Text(s.into()) }
+fn tool(name: &'static str, args: Value) -> Script { Script::Tools(vec![(name, args.to_string())]) }
 fn n_assist(r: &Value) -> usize { r["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").count() }
 fn turn_end(inst: &'static str) -> impl Fn(&Value) -> bool { move |e| e["type"] == "turn_end" && e["instance"] == inst }
 
@@ -109,3 +110,54 @@ fn every_event_frame_has_a_timestamp() {
     for k in ["text_delta", "reasoning_delta", "turn_end", "step_start", "closed", "user", "incoming"] { assert!(kinds.contains(k), "{k} missing in {kinds:?}"); }
     for ev in all { assert!(ev["timestamp"].as_u64().is_some_and(|t| t > 1_600_000_000_000), "no timestamp on {ev}"); }
 }
+
+fn status_of(c: &mut Client, name: &str) -> Value { c.ok("status", json!({"instance": name}))["instances"][0].clone() }
+
+#[test]
+fn status_reports_the_turn_in_flight_the_queue_and_the_last_event() {
+    let e = Env::new("ev_status");
+    let llm = FakeLlm::start_fn(|r| match n_assist(r) {
+        0 => tool("bash", json!({"command": "sleep 2; echo slept"})),
+        _ => text("finished"),
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "s", &e.cwd, &llm, json!({"group": "g"}));
+    c.ok("build", json!({"instance": "s"}));
+    // idle: no turn, nothing queued, no events yet except the user/restored ones that do not exist
+    let idle = status_of(&mut c, "s");
+    assert!(idle["turn"].is_null() && idle["queued"] == 0 && idle["running"] == false, "{idle}");
+    assert!(idle["last_event_ts"].is_null(), "{idle}");
+    let before = common_now_ms();
+    c.ok("prompt", json!({"instance": "s", "text": "work"}));
+    // wait for the tool to be executing
+    let t = std::time::Instant::now();
+    let busy = loop {
+        let s = status_of(&mut c, "s");
+        if s["turn"]["tool"] == "bash" { break s; }
+        assert!(t.elapsed().as_secs() < 10, "never saw the tool: {s}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(busy["running"], true);
+    assert!(busy["turn"]["since"].as_u64().unwrap() >= before && busy["turn"]["step"].as_u64().unwrap() >= 1, "{busy}");
+    // messages sent to the busy instance wait until its next step
+    c.ok("send", json!({"instance": "s", "to": "s", "text": "one"}));
+    c.ok("send", json!({"instance": "s", "to": "s", "text": "two"}));
+    let q = status_of(&mut c, "s");
+    assert_eq!(q["queued"], 2, "{q}");
+    assert!(q["last_event_ts"].as_u64().unwrap() >= busy["turn"]["since"].as_u64().unwrap(), "{q}");
+    c.ok("attach", json!({"instance": "s", "since": 0}));
+    c.wait("turn end", turn_end("s"));
+    let t = std::time::Instant::now();
+    let done = loop {
+        let s = status_of(&mut c, "s");
+        if s["turn"].is_null() && s["running"] == false { break s; }
+        assert!(t.elapsed().as_secs() < 10, "{s}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(done["queued"], 0, "{done}");
+    // the existing fields are still there
+    for k in ["instance", "cwd", "group", "running", "crashed", "built", "events", "thinking", "pid", "ports", "agents"] { assert!(done.get(k).is_some(), "{k} missing: {done}"); }
+}
+
+fn common_now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 }

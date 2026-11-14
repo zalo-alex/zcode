@@ -307,6 +307,9 @@ impl Swarm {
         }
     }
 
+    /// Messages queued for `name` that it has not read yet.
+    pub fn queued(&self, name: &str) -> usize { self.st.lock().unwrap().agents.get(name).map(|a| a.queued).unwrap_or(0) }
+
     pub fn has_agent(&self, name: &str) -> bool { self.st.lock().unwrap().agents.contains_key(name) }
     pub fn has_roots(&self) -> bool { self.st.lock().unwrap().agents.values().any(|a| a.parent.is_none()) }
 
