@@ -258,7 +258,7 @@ mod tests {
         let mut a = super::Message::text("assistant", "x");
         a.tool_calls = Some(vec![super::ToolCall { id: "c".into(), kind: "function".into(), function: super::FnCall { name: "n".into(), arguments: "{}".into() } }]);
         let msgs = vec![super::Message::text("user", "hi \u{e9}"), a, super::Message::tool("c", "out")];
-        let tools = vec![json!({"type":"function","function":{"name":"x","parameters":{"b":1,"a":2}}})];
+        let tools = [json!({"type":"function","function":{"name":"x","parameters":{"b":1,"a":2}}})];
         for tl in [&tools[..], &[]] {
             let mut want = json!({"model":"m","messages":msgs,"stream":true,"stream_options":{"include_usage":true},"max_tokens":7});
             if !tl.is_empty() { want["tools"] = json!(tl); }
