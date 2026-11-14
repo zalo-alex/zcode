@@ -25,9 +25,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Value> {
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, v: &Value) -> io::Result<()> {
-    let b = serde_json::to_vec(v).map_err(|e| bad(&e.to_string()))?;
-    if b.len() > MAX_FRAME { return Err(bad("frame too large")); }
-    w.write_all(&(b.len() as u32).to_be_bytes()).await?;
+    let mut b = vec![0u8; 4];
+    serde_json::to_writer(&mut b, v).map_err(|e| bad(&e.to_string()))?;
+    let n = b.len() - 4;
+    if n > MAX_FRAME { return Err(bad("frame too large")); }
+    b[..4].copy_from_slice(&(n as u32).to_be_bytes());
     w.write_all(&b).await?;
     w.flush().await
 }
