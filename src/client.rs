@@ -47,15 +47,18 @@ pub async fn try_run(r: Req<'_>) -> Option<i32> {
     async fn call(stream: &mut UnixStream, v: Value) -> std::io::Result<()> { write_frame(stream, &v).await }
     // optional per-app token from the client's own environment
     let mut n = 0u64;
-    let mut next = || { n += 1; n };
+    macro_rules! next { () => {{ n += 1; n }} }
     if let (Ok(app), Ok(tok)) = (std::env::var("ZCODE_APP"), std::env::var("ZCODE_APP_TOKEN")) {
-        call(&mut stream, json!({"req": next(), "op": "hello", "app": app, "token": tok})).await.ok()?;
+        call(&mut stream, json!({"req": next!(), "op": "hello", "app": app, "token": tok})).await.ok()?;
         let ack = read_frame(&mut stream).await.ok()?;
         if ack["ok"] != true { eprintln!("error: daemon rejected the app token: {}", ack["err"]); return Some(1); }
     }
-    call(&mut stream, json!({"req": next(), "op": "create", "instance": name, "cwd": r.cwd, "config": client_config(r.settings),
+    let create = json!({"op": "create", "instance": name, "cwd": r.cwd, "config": client_config(r.settings),
         "sandbox": r.sandbox, "require_sandbox": r.require_sandbox, "policy": r.policy, "max_workers": r.max_workers, "stream": r.format == Format::Default,
-        "limits": {"max_time": r.max_time.unwrap_or(0), "max_steps": r.max_steps, "max_tokens": r.max_tokens}})).await.ok()?;
+        "limits": {"max_time": r.max_time.unwrap_or(0), "max_steps": r.max_steps, "max_tokens": r.max_tokens}});
+    let mut first = create.clone();
+    first["req"] = json!(next!());
+    call(&mut stream, first).await.ok()?;
     let ack = loop {
         let v = read_frame(&mut stream).await.ok()?;
         if v.get("req").is_some() { break v; }
@@ -65,17 +68,51 @@ pub async fn try_run(r: Req<'_>) -> Option<i32> {
         eprintln!("zcode: daemon refused the run ({}); running embedded", ack["err"].as_str().unwrap_or("?"));
         return None;
     }
-    for (op, extra) in [("attach", json!({})), ("prompt", if r.images.is_empty() { json!({"text": r.prompt}) } else { json!({"text": r.prompt, "images": r.images.iter().map(|b| json!({"data": b})).collect::<Vec<_>>()}) })] {
-        let mut v = json!({"req": next(), "op": op, "instance": name});
+    let prompt_fields = if r.images.is_empty() { json!({"text": r.prompt}) } else { json!({"text": r.prompt, "images": r.images.iter().map(|b| json!({"data": b})).collect::<Vec<_>>()}) };
+    for (op, extra) in [("attach", json!({})), ("prompt", prompt_fields.clone())] {
+        let mut v = json!({"req": next!(), "op": op, "instance": name});
         if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) { for (k, x) in e { o.insert(k.clone(), x.clone()); } }
         call(&mut stream, v).await.ok()?;
     }
     let human = r.format == Format::Default;
     let mut wrote_text = false;
     let code;
+    // the daemon may restart under us (it restores its instances): events seen so far, and what to do after a reconnect
+    let hello = match (std::env::var("ZCODE_APP"), std::env::var("ZCODE_APP_TOKEN")) { (Ok(a), Ok(t)) => Some((a, t)), _ => None };
+    let (mut last_seq, mut replay, mut waiting_resume, mut resent) = (0u64, std::collections::VecDeque::<Value>::new(), false, false);
+    let mut resend_req = None;
     loop {
-        let Ok(v) = read_frame(&mut stream).await else { eprintln!("error: lost connection to the daemon"); return Some(1) };
+        let v = if let Some(v) = replay.pop_front() { v } else {
+            // after a reconnect, ten quiet seconds mean the restored instance did not take the turn back up (the daemon had not
+            // saved it as in flight): send the prompt again, once. A turn that is running answers "busy", which is ignored.
+            let wait = if waiting_resume { std::time::Duration::from_secs(10) } else { std::time::Duration::from_secs(365 * 86400) };
+            match tokio::time::timeout(wait, read_frame(&mut stream)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(_)) => {
+                    eprintln!("{}", if human { "daemon connection lost; waiting for it to come back...".yellow().to_string() } else { "daemon connection lost; waiting for it to come back...".to_string() });
+                    match reconnect(&name, &create, &hello, last_seq, &mut n).await {
+                        Some((s, events, running)) => { stream = s; waiting_resume = !running && events.is_empty(); replay.extend(events); resent = false; continue }
+                        None => { eprintln!("error: lost connection to the daemon (the run could not be resumed)"); return Some(1) }
+                    }
+                }
+                Err(_) => {
+                    waiting_resume = false;
+                    if !resent {
+                        resent = true;
+                        n += 1;
+                        resend_req = Some(n);
+                        let mut v = json!({"req": n, "op": "prompt", "instance": name});
+                        if let Some(o) = v.as_object_mut() { for (k, x) in prompt_fields.as_object().into_iter().flatten() { o.insert(k.clone(), x.clone()); } }
+                        if call(&mut stream, v).await.is_err() { continue; }
+                    }
+                    continue;
+                }
+            }
+        };
+        if let Some(s) = v["seq"].as_u64() { last_seq = last_seq.max(s); }
+        if v.get("req").is_none() { waiting_resume = false; }
         if v.get("req").is_some() {
+            if resend_req == Some(v["req"].as_u64().unwrap_or(0)) { continue; }
             if v["ok"] != true { eprintln!("error: {}", v["err"].as_str().unwrap_or("daemon error")); return Some(1); }
             continue;
         }
@@ -104,7 +141,45 @@ pub async fn try_run(r: Req<'_>) -> Option<i32> {
             break;
         }
     }
-    let _ = call(&mut stream, json!({"req": next(), "op": "close", "instance": name})).await;
+    let _ = call(&mut stream, json!({"req": next!(), "op": "close", "instance": name})).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut stream)).await;
     Some(code)
+}
+
+/// Wait for the daemon to come back (about a minute), take the instance back (`create` with `reattach`: a restored instance answers
+/// `reattached`, anything else means it is gone) and attach after `since`. Returns the stream, the events that arrived on the way,
+/// and whether a turn is running.
+async fn reconnect(name: &str, create: &Value, hello: &Option<(String, String)>, since: u64, n: &mut u64) -> Option<(UnixStream, Vec<Value>, bool)> {
+    async fn rpc(s: &mut UnixStream, n: &mut u64, mut v: Value, events: &mut Vec<Value>) -> Option<Value> {
+        *n += 1;
+        v["req"] = json!(*n);
+        write_frame(s, &v).await.ok()?;
+        loop {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(60), read_frame(s)).await.ok()?.ok()?;
+            if r["req"] == *n { return Some(r); }
+            if r.get("req").is_none() { events.push(r); }
+        }
+    }
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let Ok(mut s) = UnixStream::connect(crate::serve::socket_path()).await else { continue };
+        let mut events = vec![];
+        if let Some((app, tok)) = hello {
+            match rpc(&mut s, n, json!({"op": "hello", "app": app, "token": tok}), &mut events).await { Some(a) if a["ok"] == true => {} _ => continue }
+        }
+        let mut c = create.clone();
+        c["reattach"] = json!(true);
+        let Some(r) = rpc(&mut s, n, c, &mut events).await else { continue };
+        if r["ok"] != true { continue }
+        if r["reattached"] != true {
+            // the daemon came back without our instance: undo the empty one `create` just made
+            let _ = rpc(&mut s, n, json!({"op": "close", "instance": name}), &mut events).await;
+            return None;
+        }
+        if !matches!(rpc(&mut s, n, json!({"op": "attach", "instance": name, "since": since}), &mut events).await, Some(a) if a["ok"] == true) { continue }
+        let running = rpc(&mut s, n, json!({"op": "status", "instance": name}), &mut events).await
+            .map(|st| st["instances"][0]["running"] == true || !st["instances"][0]["turn"].is_null()).unwrap_or(false);
+        return Some((s, events, running));
+    }
+    None
 }

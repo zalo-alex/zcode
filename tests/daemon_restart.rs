@@ -162,3 +162,53 @@ fn workers_are_respawned_with_their_own_history() {
     let s = c.ok("status", json!({"instance": "boss"}));
     assert!(s["instances"][0]["agents"].as_array().unwrap().iter().any(|l| l.as_str().unwrap_or("").starts_with("w1")), "{s}");
 }
+
+fn run_via_daemon(e: &Env, llm: &FakeLlm, d: &Daemon, extra: &[&str]) -> std::process::Child {
+    let mut args = vec!["run", "--auto"];
+    args.extend_from_slice(extra);
+    args.push("do the long job");
+    e.cmd(llm, &args).env("XDG_RUNTIME_DIR", d.sock.parent().unwrap().parent().unwrap())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()
+}
+
+fn wait_requests(llm: &FakeLlm, n: usize) {
+    let t = std::time::Instant::now();
+    while llm.count() < n {
+        assert!(t.elapsed() < std::time::Duration::from_secs(15), "the model was never asked ({} requests)", llm.count());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn zcode_run_reconnects_when_the_daemon_restarts_mid_turn() {
+    let e = Env::new("r_thin");
+    // the first request hangs (the turn is in flight when the daemon dies); the restored turn gets the restart notice and answers
+    let llm = FakeLlm::start_fn(|r| if all_text(r).contains("restarted") { text("resumed after the restart") } else { Script::Stall(20) });
+    let mut d = start(&e, json!({}), &[]);
+    let child = run_via_daemon(&e, &llm, &d, &[]);
+    wait_requests(&llm, 1);
+    std::thread::sleep(std::time::Duration::from_millis(600)); // manifest writer is debounced
+    sigterm(&mut d);
+    let _d2 = start(&e, json!({}), &[]);
+    let o = child.wait_with_output().unwrap();
+    let (so, se) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.status.code(), Some(0), "stdout: {so}\nstderr: {se}");
+    assert!(so.contains("resumed after the restart"), "stdout: {so}\nstderr: {se}");
+    assert!(se.contains("daemon connection lost"), "{se}");
+}
+
+#[test]
+fn zcode_run_reports_when_the_daemon_does_not_come_back_with_its_instance() {
+    let e = Env::new("r_thin_gone");
+    let llm = FakeLlm::start_fn(|_| Script::Stall(20));
+    let mut d = start(&e, json!({}), &[]);
+    let child = run_via_daemon(&e, &llm, &d, &[]);
+    wait_requests(&llm, 1);
+    sigkill(&mut d);
+    // a fresh state dir: no manifest, so the new daemon knows nothing about the run
+    let _ = std::fs::remove_dir_all(e.dir.join("dhome/state"));
+    let _d2 = start(&e, json!({}), &[]);
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("could not be resumed"), "{}", String::from_utf8_lossy(&o.stderr));
+}
