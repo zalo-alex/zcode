@@ -3,10 +3,18 @@ use anyhow::{Result, bail};
 use regex::Regex;
 use serde_json::Value;
 
+/// one shared client: keeps connections and the TLS config across calls
+fn client() -> Result<&'static reqwest::Client> {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = C.get() { return Ok(c); }
+    let c = reqwest::Client::builder().user_agent("zcode/0.1").build()?;
+    Ok(C.get_or_init(|| c))
+}
+
 pub async fn fetch(a: &Value) -> Result<String> {
     let url = s(a, "url")?;
     if !url.starts_with("http") { bail!("url must be http(s)"); }
-    let r = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).user_agent("zcode/0.1").build()?.get(url).send().await?;
+    let r = client()?.get(url).timeout(std::time::Duration::from_secs(20)).send().await?;
     if !r.status().is_success() { bail!("HTTP {}", r.status()); }
     let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let body = r.text().await?;
@@ -31,8 +39,9 @@ pub async fn search(a: &Value) -> Result<String> {
         "params": {"name": "web_search_exa", "arguments": args},
     });
     let url = std::env::var("ZCODE_WEBSEARCH_URL").unwrap_or_else(|_| EXA_URL.into());
-    let r = reqwest::Client::builder().timeout(std::time::Duration::from_secs(25)).user_agent("zcode/0.1").build()?
+    let r = client()?
         .post(url)
+        .timeout(std::time::Duration::from_secs(25))
         .header("accept", "application/json, text/event-stream")
         .json(&body)
         .send().await?;
@@ -61,9 +70,12 @@ pub fn parse_response(body: &str) -> Result<String> {
 }
 
 pub fn html_to_text(body: &str) -> Result<String> {
-    let strip = Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")?;
-    let tags = Regex::new(r"(?s)<[^>]+>")?;
-    let ws = Regex::new(r"\n\s*\n+")?;
+    static RE: std::sync::OnceLock<(Regex, Regex, Regex)> = std::sync::OnceLock::new();
+    let (strip, tags, ws) = RE.get_or_init(|| (
+        Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->").unwrap(),
+        Regex::new(r"(?s)<[^>]+>").unwrap(),
+        Regex::new(r"\n\s*\n+").unwrap(),
+    ));
     let s1 = strip.replace_all(body, "").into_owned();
     let t = tags.replace_all(&s1, "");
     let t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&nbsp;", " ");
