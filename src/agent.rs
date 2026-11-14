@@ -207,10 +207,15 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
 
     /// Wait for the next message (idle workers park here); None when the swarm shut down.
     pub async fn recv_blocking(&mut self) -> Option<Msg> {
-        let m = self.inbox.as_mut()?.recv().await?;
-        if let Some(sw) = &self.swarm { sw.consumed(&self.name, 1); }
-        self.last_hops = m.hops;
-        Some(m)
+        loop {
+            let m = self.inbox.as_mut()?.recv().await?;
+            if let Some(sw) = &self.swarm {
+                if sw.is_dropped(&self.name, m.id) { continue; } // cancelled while queued
+                sw.consumed(&self.name, 1);
+            }
+            self.last_hops = m.hops;
+            return Some(m);
+        }
     }
 
     /// Push delivery: queued messages become user turns before the next model call.
@@ -218,6 +223,8 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
         let Some(rx) = self.inbox.as_mut() else { return };
         let mut got = vec![];
         while let Ok(m) = rx.try_recv() { got.push(m); }
+        // messages a `cancel` dropped are skipped (they were already taken off the queue count)
+        if let Some(sw) = &self.swarm { got.retain(|m| !sw.is_dropped(&self.name, m.id)); }
         if got.is_empty() { return; }
         if let Some(sw) = &self.swarm { sw.consumed(&self.name, got.len()); }
         for m in got {

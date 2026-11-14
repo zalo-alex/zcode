@@ -601,7 +601,16 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             if let Some(on) = req["on"].as_bool() { inst.thinking.store(on, Ordering::SeqCst); }
             Ok(json!({"thinking": inst.thinking.load(Ordering::SeqCst)}))
         }
-        "cancel" => { d.find(app, str_of(req, "instance")?)?.cancel.cancel(); Ok(json!({})) }
+        "cancel" => {
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            // drop the queue first, or the instance would wake up for those messages the moment the turn ends
+            let sw = inst.swarm.lock().unwrap().clone();
+            let dropped = sw.map(|s| s.drop_queued(&inst.name)).unwrap_or(0);
+            // a running turn ends by itself with `turn_end` `{stop: "interrupted"}`; on an idle instance there is nothing to interrupt
+            let interrupted = inst.running.load(Ordering::SeqCst);
+            if interrupted { inst.cancel.cancel(); }
+            Ok(json!({"dropped": dropped, "interrupted": interrupted}))
+        }
         "close" => {
             let n = str_of(req, "instance")?.to_string();
             if let Some(h) = attached.remove(&n) { h.abort(); }

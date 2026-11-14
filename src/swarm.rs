@@ -94,6 +94,8 @@ struct Entry {
     write: Vec<PathBuf>,
     /// `{prompt, write, profile}` of a worker (to respawn it after a daemon restart)
     spawn: Value,
+    /// messages with an id up to this one were dropped by a `cancel` and must not be delivered
+    drop_upto: u64,
 }
 
 #[derive(Default)]
@@ -175,7 +177,7 @@ impl Swarm {
             auto: sc.auto, require: sc.require, session_base: sc.session_base.clone(), model: sc.model.clone(), lead_tier: sc.lead_tier, idmap_full: sc.idmap_full,
             limits: sc.limits.clone(), format: sc.format });
         st.agents.insert(root.into(), Entry { ctx: sc_arc, tx, status: Status::Running, queued: 0, parent: None, tier: lead_sandbox.tier(), sandbox: lead_sandbox,
-            handle: None, steps: 0, tin: 0, tout: 0, write: vec![], spawn: Value::Null });
+            handle: None, steps: 0, tin: 0, tout: 0, write: vec![], spawn: Value::Null, drop_upto: 0 });
         let sw = Swarm { st: Mutex::new(st), sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))), budget: Budget::new(&if cfg.unbounded { Limits { max_time: None, max_steps: usize::MAX / 2, max_tokens: u64::MAX / 2 } } else { sc.limits.clone() }), cfg, notify: Notify::new(),
             next_id: AtomicU64::new(1), sc, print: Mutex::new(()) };
         (Arc::new(sw), rx)
@@ -188,7 +190,7 @@ impl Swarm {
         if st.agents.contains_key(name) { return Err(format!("agent `{name}` already exists in this group")); }
         let (tx, rx) = mpsc::unbounded_channel();
         st.agents.insert(name.into(), Entry { ctx: Arc::new(sc), tx, status: Status::Running, queued: 0, parent: None, tier: sandbox.tier(), sandbox,
-            handle: None, steps: 0, tin: 0, tout: 0, write: vec![], spawn: Value::Null });
+            handle: None, steps: 0, tin: 0, tout: 0, write: vec![], spawn: Value::Null, drop_upto: 0 });
         Ok(rx)
     }
 
@@ -306,6 +308,24 @@ impl Swarm {
             n.await;
         }
     }
+
+    /// Forget the messages queued for `name` that it has not read (a `cancel`); returns how many. They still sit in its channel
+    /// and are skipped when it drains it (`is_dropped`); ids are assigned under the same lock, so nothing is lost or doubled.
+    pub fn drop_queued(&self, name: &str) -> usize {
+        let mut st = self.st.lock().unwrap();
+        let upto = self.next_id.load(Ordering::Relaxed).saturating_sub(1);
+        let Some(a) = st.agents.get_mut(name) else { return 0 };
+        let n = a.queued;
+        a.queued = 0;
+        a.drop_upto = upto;
+        st.in_flight = st.in_flight.saturating_sub(n);
+        drop(st);
+        self.notify.notify_waiters();
+        n
+    }
+
+    /// True for a message `drop_queued` already accounted for.
+    pub fn is_dropped(&self, name: &str, id: u64) -> bool { self.st.lock().unwrap().agents.get(name).is_some_and(|a| id <= a.drop_upto) }
 
     /// Messages queued for `name` that it has not read yet.
     pub fn queued(&self, name: &str) -> usize { self.st.lock().unwrap().agents.get(name).map(|a| a.queued).unwrap_or(0) }
@@ -460,7 +480,7 @@ impl Swarm {
             if st.agents.contains_key(name) { return Err(format!("agent `{name}` already exists")); }
             st.agents.insert(name.to_string(), Entry { ctx: sc.clone(), tx, status: Status::Running, queued: 0, parent: Some(parent.into()), tier: sandbox.tier(), sandbox: sandbox.clone(),
                 handle: None, steps: 0, tin: 0, tout: 0, write: wpaths,
-                spawn: json!({"prompt": prompt, "write": write, "profile": profile}) });
+                spawn: json!({"prompt": prompt, "write": write, "profile": profile}), drop_upto: 0 });
         }
         self.ev("spawn", json!({"agent": name, "parent": parent, "tier": sandbox.tier().n(), "write": write, "profile": profile}));
         if sandbox.tier() == Tier::Container {

@@ -228,3 +228,45 @@ fn history_pairs_tool_calls_and_survives_a_restart() {
     let again = c.ok("history", json!({"instance": "h"}));
     assert_eq!(again["items"], live["items"]);
 }
+
+#[test]
+fn cancel_drops_queued_messages_and_is_harmless_when_idle() {
+    let e = Env::new("ev_cancel");
+    let llm = FakeLlm::start_fn(|r| {
+        let all = r["messages"].to_string();
+        if all.contains("long job") && n_assist(r) == 0 { tool("bash", json!({"command": "sleep 30"})) } else { text("calm") }
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "k", &e.cwd, &llm, json!({"group": "g"}));
+    c.ok("attach", json!({"instance": "k"}));
+    // idle: a no-op reply, not an error
+    let idle = c.ok("cancel", json!({"instance": "k"}));
+    assert_eq!((idle["dropped"].as_u64(), idle["interrupted"].as_bool()), (Some(0), Some(false)), "{idle}");
+    c.ok("prompt", json!({"instance": "k", "text": "long job"}));
+    c.wait("tool running", |x| x["type"] == "tool_start");
+    c.ok("send", json!({"instance": "k", "to": "k", "text": "queued-one"}));
+    c.ok("send", json!({"instance": "k", "to": "k", "text": "queued-two"}));
+    assert_eq!(status_of(&mut c, "k")["queued"], 2);
+    let r = c.ok("cancel", json!({"instance": "k"}));
+    assert_eq!((r["dropped"].as_u64(), r["interrupted"].as_bool()), (Some(2), Some(true)), "{r}");
+    let end = c.wait("interrupted turn end", turn_end("k"));
+    assert_eq!((end["stop"].as_str(), end["code"].as_i64()), (Some("interrupted"), Some(130)));
+    // nothing wakes the instance for the dropped messages
+    let calls = llm.count();
+    c.events.clear();
+    c.drain(1200);
+    assert_eq!(llm.count(), calls, "no model call after the cancel");
+    assert!(!c.events.iter().any(|x| x["type"] == "step_start"), "{:?}", c.events);
+    let s = status_of(&mut c, "k");
+    assert!(s["running"] == false && s["queued"] == 0 && s["turn"].is_null(), "{s}");
+    // and they never reach the conversation later
+    c.ok("prompt", json!({"instance": "k", "text": "next"}));
+    c.wait("next turn", turn_end("k"));
+    let last = llm.req(llm.count() - 1);
+    let seen = last["messages"].to_string();
+    assert!(!seen.contains("queued-one") && !seen.contains("queued-two"), "{seen}");
+    // a message sent after the cancel is delivered normally
+    c.ok("send", json!({"instance": "k", "to": "k", "text": "fresh-one"}));
+    c.wait("woken for the fresh message", |x| x["type"] == "incoming" && x["text"] == "fresh-one");
+}
