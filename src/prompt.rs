@@ -1,8 +1,19 @@
 use std::path::Path;
 
+/// Local date as `YYYY-MM-DD` (same as `date +%Y-%m-%d`) without forking a process.
+fn today() -> String {
+    unsafe extern "C" { fn tzset(); }
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        tzset();
+        if libc::localtime_r(&t, &mut tm).is_null() { return String::new(); }
+        format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+    }
+}
+
 pub fn system(cwd: &Path, readonly: bool) -> String {
-    let date = std::process::Command::new("date").arg("+%Y-%m-%d").output().ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let date = today();
     let mut s = format!(
 "You are zcode, a fast terminal coding agent. Help the user with software engineering tasks using the provided tools.
 
