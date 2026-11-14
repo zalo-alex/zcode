@@ -345,3 +345,42 @@ fn custom_caps_ulimits_sysctls_and_oci_patch_apply() {
     assert!(b.contains("nofile=777") && b.contains("hard=888"), "{b}");
     assert!(b.contains("ping=0 0") && b.contains("host=patched"), "{b}");
 }
+
+#[test]
+fn images_cross_the_guest_boundary_from_read_and_from_bash() {
+    let Some((e, cfg)) = setup("c_images", json!({"vision": true, "profiles":{"box":{"sandbox":"container"}}})) else { return };
+    // a valid 1x1 PNG, and a big image-looking file: it must arrive whole (a frame carries 8 MB), so the host can say it is undecodable
+    let png = zcode_tools::img::b64_decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==").unwrap();
+    std::fs::write(e.cwd.join("one.png"), &png).unwrap();
+    std::fs::write(e.cwd.join("one.b64"), zcode_tools::img::b64_encode(&png)).unwrap();
+    let mut big = b"\x89PNG\r\n\x1a\n".to_vec();
+    big.resize(4_900_000, 0);
+    std::fs::write(e.cwd.join("big.png"), &big).unwrap();
+    let llm = FakeLlm::start_fn(|r| {
+        let (w, n) = (who(r), n_assist(r));
+        match (w.as_str(), n) {
+            ("lead", 0) => tool("spawn", json!({"name":"w","prompt":"look at the images","write":["one.png"],"profile":"box"})),
+            ("lead", 1) => tool("wait", json!({})),
+            ("lead", 2) if !all_text(r).contains("worker finished") => tool("wait", json!({})),
+            ("lead", _) => text("fin"),
+            (_, 0) => tool("read", json!({"path":"one.png"})),
+            (_, 1) => tool("bash", json!({"command":"cat one.b64"})),
+            (_, 2) => tool("read", json!({"path":"big.png"})),
+            _ => text("worker finished"),
+        }
+    });
+    let o = cmd(&e, &llm, cfg, &["--max-workers", "2", "--sandbox", "none"]).output().unwrap();
+    if skip_if_unavailable(&o) { return; }
+    assert_eq!(code(&o), 0, "{}\n{}", err(&o), out(&o));
+    // the worker's last request: three tool results, the first two are images, the third is a note
+    let reqs: Vec<Value> = (0..llm.count()).map(|i| llm.req(i)).filter(|r| who(r) == "w" && n_assist(r) == 3).collect();
+    let r = reqs.first().expect("the worker made its third request");
+    let tools: Vec<&Value> = r["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").collect();
+    assert_eq!(tools.len(), 3);
+    for (i, t) in tools[..2].iter().enumerate() {
+        let parts = t["content"].as_array().unwrap_or_else(|| panic!("tool {i} is not parts: {t}"));
+        assert_eq!(parts[1]["type"], "image_url", "{t}");
+    }
+    assert!(tools[2]["content"].as_str().unwrap().contains("could not be decoded"), "{}", tools[2]);
+    assert!(!r.to_string().contains("frame too large"));
+}
