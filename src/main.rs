@@ -181,9 +181,13 @@ fn main() {
     amain()
 }
 
-#[tokio::main]
-async fn amain() {
+fn amain() {
+    // parse first: --help/--version/usage errors exit without ever building the runtime
     let cli = Cli::parse();
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime").block_on(run(cli));
+}
+
+async fn run(cli: Cli) {
     let json = match &cli.cmd { Some(Cmd::Run { common, .. }) => common.format, _ => cli.common.format } == Format::Json;
     let code = match real_main(cli).await {
         Ok(c) => c,

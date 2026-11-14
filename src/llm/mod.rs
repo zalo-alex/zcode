@@ -93,6 +93,12 @@ fn upstream_err_re() -> &'static Regex {
     R.get_or_init(|| Regex::new(r"(?i)^\s*\[[^\]]*(upstream|provider|gateway)[^\]]*error[^\]]*\]\s*$").unwrap())
 }
 
+/// One process-wide client (shared by the main and small model): one TLS config, shared connection pool.
+fn http_client() -> reqwest::Client {
+    static C: OnceLock<reqwest::Client> = OnceLock::new();
+    C.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap()).clone()
+}
+
 /// Request body; fields in alphabetical order so the bytes equal what a `json!` map (sorted keys) produced.
 #[derive(serde::Serialize)]
 struct ChatBody<'a> {
@@ -111,7 +117,7 @@ impl Client {
     pub fn new(cfg: Config) -> Self {
         let idle: f64 = std::env::var("ZCODE_STREAM_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120.0);
         Client {
-            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap(),
+            http: http_client(),
             cfg,
             idle: Duration::from_millis((idle * 1000.0) as u64),
         }
