@@ -21,7 +21,24 @@ short, user-facing release text in markdown, ready to paste into the GitHub rele
    - Tag doesn't exist yet: run without `TAG`; commits since the latest tag up to `HEAD`. Use the given tag for the
      title.
    - Output: range, compare URL, then per commit: hash, subject, body, changed files with +/- counts.
-4. **Check the version.** `version` in the root `Cargo.toml`, `crates/*/Cargo.toml` and `Cargo.lock` (the workspace
+4. **Run the CI checks locally, before bumping or tagging.** The tag push triggers the `release` workflow and the
+   branch push triggers `ci`, so code that fails CI must never be tagged or pushed. Mirror `.github/workflows/ci.yml`
+   exactly (read it first; if it changed, follow it, not this list), from the repo root, stopping at the first failure:
+   ```bash
+   cargo clippy --workspace --all-targets --locked -- -D warnings
+   cargo test --workspace --locked
+   cargo clippy --workspace --all-targets --locked --features oci -- -D warnings
+   cargo test -p zcode-tools --locked --features oci
+   ```
+   - Use a long Bash timeout (`600000`). `--locked` matters: it fails when `Cargo.lock` is stale.
+   - `cargo test` alone is not enough: clippy runs with `-D warnings`, so any warning (also in tests) fails CI.
+   - If something fails, **stop**: report the failure, don't bump, tag or push. Fix it (as a normal commit) only if the
+     user asks, then restart from this step. A test that fails only under parallel load (e.g. in `tests/daemon.rs`):
+     re-run that test file alone before judging; say it was flaky.
+   - Some CI tests need `crun`, `busybox-static`, `passt`, `slirp4netns`, `fuse-overlayfs` (installed in CI). If a
+     tool is missing locally and its tests fail for that reason, say which checks could not be verified.
+   - After the bump commit (step 5) re-run `cargo check --locked` so the refreshed `Cargo.lock` is accepted.
+5. **Check the version.** `version` in the root `Cargo.toml`, `crates/*/Cargo.toml` and `Cargo.lock` (the workspace
    packages' entries) must equal the release version (tag without `v`), because `zcode --version` prints it.
    - **Releasing** (the tag doesn't exist yet): check the working tree. If it differs, **bump it**: edit those files
      (refresh `Cargo.lock` with `cargo update --workspace --offline` or `cargo check --offline`), then commit with
@@ -30,14 +47,14 @@ short, user-facing release text in markdown, ready to paste into the GitHub rele
    - **Already released** (tag exists): check the tag's files, e.g. `git show vX.Y.Z:Cargo.toml`. If it differs, the
      published binaries report the wrong version and can't be fixed; say so and that the next release must carry the
      right one. Don't bump, don't re-tag.
-5. **Understand vague subjects.** Commit subjects are short (under 40 chars) on purpose. When a subject doesn't say
+6. **Understand vague subjects.** Commit subjects are short (under 40 chars) on purpose. When a subject doesn't say
    what a user would notice, look at the files list and, if still unclear, `git show <hash>` for that commit only.
-6. **Write the notes** (rules below), save them to a fresh temp file `release-notes.md` (e.g. via `mktemp -d`);
+7. **Write the notes** (rules below), save them to a fresh temp file `release-notes.md` (e.g. via `mktemp -d`);
    don't put it in the repo. Leave the version bump commit out of the notes.
-7. **Create the tag** only if it doesn't exist: `git tag vX.Y.Z` on the commit that carries the right version
-   (the bump commit, or `HEAD` if no bump was needed; lightweight, no message). Never move, delete or re-create an
-   existing tag. Don't push it unless the user asks.
-8. **Answer** with the markdown in a fenced ```` ```markdown ```` block, then say whether the version was bumped and
+8. **Create the tag** only if it doesn't exist: `git tag vX.Y.Z` on the commit that carries the right version
+   (the bump commit, or `HEAD` if no bump was needed; only after step 4 passed; lightweight, no message). Never move, delete or re-create an
+   existing tag. Don't push it unless the user asks (and only after step 4 passed on the commit being pushed).
+9. **Answer** with the markdown in a fenced ```` ```markdown ```` block, then say whether the version was bumped and
    the tag created (or why not), then the file as a clickable markdown link
    `[release-notes.md](/abs/path/release-notes.md)` (never in backticks). One plain line outside the block if you
    skipped or merged anything noteworthy.
