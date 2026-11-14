@@ -423,7 +423,11 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
         let parsed: Vec<Result<Value, String>> = calls.iter().map(|c| parse_args(&c.function.arguments)).collect();
         for (c, p) in calls.iter().zip(&parsed) {
             if self.human() { eprintln!("{} {}", "▸".cyan(), summarize(&c.function.name, p.as_ref().ok()).dimmed()); }
-            else if self.stream && self.json() { events::custom(self.sid(), "tool_start", serde_json::json!({"tool": c.function.name, "summary": summarize(&c.function.name, p.as_ref().ok())})); }
+            else if self.json() && (self.stream || self.daemon) {
+                // `callID` + `input` pair this with the later `tool_use` even when several calls of a step run at once
+                let input = p.as_ref().map(|a| cap_strings(a, TOOL_INPUT_CAP)).unwrap_or(Value::Null);
+                events::custom(self.sid(), "tool_start", serde_json::json!({"tool": c.function.name, "callID": c.id, "summary": summarize(&c.function.name, p.as_ref().ok()), "input": input}));
+            }
             else if self.worker && let Some(sw) = &self.swarm { sw.show(&self.name, &format!("▸ {}", summarize(&c.function.name, p.as_ref().ok()))); }
         }
         // permissions are interactive → check sequentially first
@@ -527,6 +531,18 @@ mod tests {
     fn repairs_trailing_junk() {
         assert_eq!(parse_args("{\"a\":1}}").unwrap()["a"], 1);
         assert!(parse_args("not json").is_err());
+    }
+}
+
+/// Longest string kept in a `tool_start` input (bigger ones keep head and tail, like tool output).
+const TOOL_INPUT_CAP: usize = 8000;
+
+fn cap_strings(v: &Value, max: usize) -> Value {
+    match v {
+        Value::String(s) if s.len() > max => Value::String(tools::cap(s.clone(), max)),
+        Value::Array(a) => Value::Array(a.iter().map(|x| cap_strings(x, max)).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), cap_strings(x, max))).collect()),
+        _ => v.clone(),
     }
 }
 

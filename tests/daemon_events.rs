@@ -6,6 +6,7 @@ use dm::*;
 use serde_json::{Value, json};
 
 fn text(s: &str) -> Script { Script::Text(s.into()) }
+fn n_assist(r: &Value) -> usize { r["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").count() }
 fn turn_end(inst: &'static str) -> impl Fn(&Value) -> bool { move |e| e["type"] == "turn_end" && e["instance"] == inst }
 
 #[test]
@@ -42,4 +43,44 @@ fn thin_clients_do_not_print_daemon_only_events() {
     assert!(lines.iter().all(|l| !matches!(l["type"].as_str(), Some("user" | "partial" | "tool_start"))), "{lines:?}");
     assert!(lines.iter().any(|l| l["type"] == "text"));
     assert!(d.home.join("data/zcode/sessions").read_dir().unwrap().count() >= 1, "the daemon ran it");
+}
+
+fn tool_pairs(events: &[Value], agent: &str) -> Vec<(String, Value, Value)> {
+    let starts: Vec<&Value> = events.iter().filter(|x| x["type"] == "tool_start" && x["agent"] == agent).collect();
+    starts.iter().map(|s| {
+        let id = s["callID"].as_str().expect("tool_start has a callID").to_string();
+        let end = events.iter().find(|x| x["type"] == "tool_use" && x["part"]["callID"] == id.as_str()).unwrap_or_else(|| panic!("no tool_use for {id}"));
+        (id, (*s).clone(), end.clone())
+    }).collect()
+}
+
+#[test]
+fn tool_start_carries_the_call_id_and_input_so_parallel_calls_pair_exactly() {
+    let e = Env::new("ev_pair");
+    std::fs::write(e.cwd.join("a.txt"), "alpha").unwrap();
+    std::fs::write(e.cwd.join("b.txt"), "beta").unwrap();
+    let big = "x".repeat(40_000);
+    let llm = FakeLlm::start_fn(move |r| match n_assist(r) {
+        0 => Script::Tools(vec![("read", json!({"path": "a.txt"}).to_string()), ("read", json!({"path": "b.txt"}).to_string()), ("grep", json!({"pattern": big}).to_string())]),
+        _ => text("done"),
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "p", &e.cwd, &llm, json!({}));
+    c.ok("attach", json!({"instance": "p"}));
+    c.ok("prompt", json!({"instance": "p", "text": "read both"}));
+    c.wait("turn end", turn_end("p"));
+    let pairs = tool_pairs(&c.events, "p");
+    assert_eq!(pairs.len(), 3, "{:?}", c.events);
+    let ids: std::collections::HashSet<&String> = pairs.iter().map(|p| &p.0).collect();
+    assert_eq!(ids.len(), 3, "call ids are distinct");
+    for (_, s, end) in &pairs {
+        assert_eq!(s["tool"], end["part"]["tool"]);
+        // the parsed input object, the same one the tool_use reports (unless it was huge and got capped)
+        if s["tool"] != "grep" { assert_eq!(s["input"], end["part"]["state"]["input"]); }
+    }
+    let by_path = |p: &str| pairs.iter().find(|(_, s, _)| s["input"]["path"] == p).map(|x| x.2["part"]["state"]["output"].as_str().unwrap().to_string()).unwrap();
+    assert!(by_path("a.txt").contains("alpha") && by_path("b.txt").contains("beta"));
+    let grep = pairs.iter().find(|(_, s, _)| s["tool"] == "grep").unwrap();
+    assert!(grep.1["input"]["pattern"].as_str().unwrap().len() < 20_000, "huge input is capped");
 }
