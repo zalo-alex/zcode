@@ -100,6 +100,8 @@ impl Instance {
     fn push_event(&self, mut v: Value) {
         v["instance"] = json!(self.name);
         if v["agent"] == "lead" { v["agent"] = json!(self.name); }
+        // events the daemon makes itself (`closed`, `warning`, ...) carry the same `timestamp` as the agents' ones
+        if v.get("timestamp").is_none() { v["timestamp"] = json!(events::now_ms()); }
         let mut b = self.buf.lock().unwrap();
         b.seq += 1;
         v["seq"] = json!(b.seq);

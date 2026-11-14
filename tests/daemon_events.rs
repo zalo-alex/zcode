@@ -84,3 +84,28 @@ fn tool_start_carries_the_call_id_and_input_so_parallel_calls_pair_exactly() {
     let grep = pairs.iter().find(|(_, s, _)| s["tool"] == "grep").unwrap();
     assert!(grep.1["input"]["pattern"].as_str().unwrap().len() < 20_000, "huge input is capped");
 }
+
+#[test]
+fn every_event_frame_has_a_timestamp() {
+    let e = Env::new("ev_ts");
+    let llm = FakeLlm::start_fn(|r| {
+        let all = r["messages"].to_string();
+        if all.contains("ping") { text("got the message") } else { Script::Reasoning("pondering".into(), "answer".into()) }
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "t1", &e.cwd, &llm, json!({"group": "g", "stream": true, "thinking": true}));
+    c.ok("attach", json!({"instance": "t1"}));
+    let mut obs = Client::connect(&d); // `close` stops the closing connection's own forwarder, so another client sees `closed`
+    obs.ok("attach", json!({"instance": "t1"}));
+    c.ok("prompt", json!({"instance": "t1", "text": "think about it"}));
+    let mut waited = vec![c.wait("first turn", turn_end("t1"))];
+    c.ok("send", json!({"instance": "t1", "to": "t1", "text": "ping"}));
+    waited.push(c.wait("woken turn", |x| x["type"] == "turn_end" && x["text"] == "got the message"));
+    c.ok("close", json!({"instance": "t1"}));
+    waited.push(obs.wait("closed", |x| x["type"] == "closed"));
+    let all: Vec<&Value> = c.events.iter().chain(obs.events.iter()).chain(waited.iter()).collect();
+    let kinds: std::collections::HashSet<&str> = all.iter().filter_map(|x| x["type"].as_str()).collect();
+    for k in ["text_delta", "reasoning_delta", "turn_end", "step_start", "closed", "user", "incoming"] { assert!(kinds.contains(k), "{k} missing in {kinds:?}"); }
+    for ev in all { assert!(ev["timestamp"].as_u64().is_some_and(|t| t > 1_600_000_000_000), "no timestamp on {ev}"); }
+}
