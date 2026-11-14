@@ -40,6 +40,17 @@ Edits are shown as a diff so you can see exactly what changed. Mention how to ch
 | `task` | hand a broad "go and explore" job to a read-only helper to save room in the conversation |
 | `todowrite`, `todoread` | keep a checklist for a long job (`/todo` shows it) |
 
+## Images
+
+If the model can see images, zcode sends them as pixels:
+
+- `read` on a PNG, JPEG, GIF or WebP file shows the model the image. So does a command that prints only the image as base64 (or a `data:image/...;base64,` URL).
+- `zcode --image shot.png "what is wrong here?"` (repeatable) attaches images to your first message. In the REPL, `/image shot.png` attaches one to your next message.
+
+Images are shrunk to at most 1568 px on the long edge and sent as JPEG (GIFs are left as they are). Files over 5 MB are not sent. At most 4 images per tool result and 8 in the conversation are kept; old ones are dropped first.
+
+Whether the model can see images is guessed from its name (`claude-*`, `gpt-4o`, `gemini-*`, `qwen-vl`, `llava`...). Set `"vision": true` or `false` in the config (top level, or on one model under `provider.<name>.models.<model>`) to override. When it is off, the model only gets a text line saying an image was attached.
+
 ## Pipes and scripts
 
 If you give no message and stdin is a pipe, zcode reads the message from it:

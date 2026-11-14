@@ -139,8 +139,8 @@ pub fn items(msgs: &[Message]) -> Vec<Value> {
         match m.role.as_str() {
             "user" | "assistant" => {
                 let k = if m.role == "user" { "user" } else { "text" };
-                if let Some(c) = m.content.as_deref().filter(|c| !c.is_empty()) {
-                    let (text, was) = cut(c);
+                if let Some(c) = m.content.as_ref().map(|c| c.to_text()).filter(|c| !c.is_empty()) {
+                    let (text, was) = cut(&c);
                     let mut it = json!({"k": k, "text": text});
                     if was { it["cut"] = json!(true); }
                     out.push(it);
@@ -159,7 +159,8 @@ pub fn items(msgs: &[Message]) -> Vec<Value> {
                 let slot = pending.iter().position(|p| p.1 == id).or(if pending.is_empty() { None } else { Some(0) });
                 let Some(s) = slot else { continue };
                 let (i, _) = pending.remove(s);
-                let body = m.content.as_deref().unwrap_or("");
+                let body = m.text_view();
+                let body = &*body;
                 let (output, was) = cut(body);
                 out[i]["output"] = json!(output);
                 out[i]["ok"] = json!(!body.starts_with("Error:"));

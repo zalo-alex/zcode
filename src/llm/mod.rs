@@ -26,7 +26,7 @@ pub struct FnCall {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<Content>,
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -34,12 +34,74 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+/// Message content: a bare string (all text-only traffic, byte-identical to before) or OpenAI multi-part content.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Part {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageUrl { pub url: String }
+
+impl Part {
+    pub fn text(s: impl Into<String>) -> Part { Part::Text { text: s.into() } }
+    pub fn image(url: impl Into<String>) -> Part { Part::ImageUrl { image_url: ImageUrl { url: url.into() } } }
+    pub fn is_image(&self) -> bool { matches!(self, Part::ImageUrl { .. }) }
+}
+
+impl From<String> for Content { fn from(s: String) -> Self { Content::Text(s) } }
+impl From<&str> for Content { fn from(s: &str) -> Self { Content::Text(s.into()) } }
+
+impl Content {
+    /// The string of a text-only content (`None` for parts).
+    #[cfg(test)]
+    pub fn as_text(&self) -> Option<&str> {
+        match self { Content::Text(s) => Some(s), Content::Parts(_) => None }
+    }
+    /// Plain-text view for surfaces that cannot show pixels: text parts joined by newlines, each image as `[image WxH]`.
+    pub fn to_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Content::Text(s) => s.into(),
+            Content::Parts(ps) => ps.iter().map(|p| match p {
+                Part::Text { text } => text.clone(),
+                Part::ImageUrl { image_url } => crate::img::label(&image_url.url),
+            }).collect::<Vec<_>>().join("\n").into(),
+        }
+    }
+    /// Size in chars for the context estimate (a data URL counts at its full length, a fair proxy for its tokens).
+    pub fn size(&self) -> usize {
+        match self {
+            Content::Text(s) => s.len(),
+            Content::Parts(ps) => ps.iter().map(|p| match p { Part::Text { text } => text.len(), Part::ImageUrl { image_url } => image_url.url.len() }).sum(),
+        }
+    }
+    pub fn image_count(&self) -> usize {
+        match self { Content::Text(_) => 0, Content::Parts(ps) => ps.iter().filter(|p| p.is_image()).count() }
+    }
+}
+
 impl Message {
     pub fn text(role: &str, s: impl Into<String>) -> Self {
-        Message { role: role.into(), content: Some(s.into()), tool_calls: None, tool_call_id: None }
+        Message { role: role.into(), content: Some(Content::Text(s.into())), tool_calls: None, tool_call_id: None }
     }
     pub fn tool(id: &str, s: impl Into<String>) -> Self {
-        Message { role: "tool".into(), content: Some(s.into()), tool_calls: None, tool_call_id: Some(id.into()) }
+        Message { role: "tool".into(), content: Some(Content::Text(s.into())), tool_calls: None, tool_call_id: Some(id.into()) }
+    }
+    pub fn tool_parts(id: &str, parts: Vec<Part>) -> Self {
+        Message { role: "tool".into(), content: Some(Content::Parts(parts)), tool_calls: None, tool_call_id: Some(id.into()) }
+    }
+    /// Text of this message's content, or `""`.
+    pub fn text_view(&self) -> std::borrow::Cow<'_, str> {
+        self.content.as_ref().map_or("".into(), |c| c.to_text())
     }
 }
 
@@ -91,6 +153,17 @@ fn overflow_re() -> &'static Regex {
 fn upstream_err_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)^\s*\[[^\]]*(upstream|provider|gateway)[^\]]*error[^\]]*\]\s*$").unwrap())
+}
+
+/// Parts → one string, each image replaced by a note (for models that cannot see).
+pub fn flatten_images(msgs: &[Message]) -> Vec<Message> {
+    msgs.iter().map(|m| match &m.content {
+        Some(Content::Parts(ps)) => {
+            let text = ps.iter().map(|p| match p { Part::Text { text } => text.as_str(), Part::ImageUrl { .. } => crate::img::BLIND }).collect::<Vec<_>>().join("\n");
+            Message { content: Some(Content::Text(text)), ..m.clone() }
+        }
+        _ => m.clone(),
+    }).collect()
 }
 
 /// One process-wide client (shared by the main and small model): one TLS config, shared connection pool.
@@ -157,6 +230,9 @@ impl Client {
     }
 
     async fn chat_once(&self, msgs: &[Message], tools: &[Value], on_delta: &mut impl FnMut(Delta)) -> Result<Reply> {
+        // never send image parts to a model known to be text-only (history may hold some from another model or session)
+        let flat;
+        let msgs = if !self.cfg.vision && msgs.iter().any(|m| matches!(m.content, Some(Content::Parts(_)))) { flat = flatten_images(msgs); &flat[..] } else { msgs };
         let body = ChatBody { max_tokens: self.cfg.max_output, messages: msgs, model: &self.cfg.model, stream: true,
             stream_options: StreamOptions { include_usage: true }, tools: if tools.is_empty() { None } else { Some(tools) } };
         let mut rb = self.http.post(format!("{}/chat/completions", self.cfg.base_url)).json(&body);
@@ -253,6 +329,30 @@ pub fn apply_chunk(reply: &mut Reply, v: &Value, on_delta: &mut impl FnMut(Delta
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_serializes_as_a_string_or_parts_and_round_trips() {
+        let m = Message::text("user", "hi");
+        assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"content":"hi","role":"user"}"#);
+        let m = Message::tool_parts("c1", vec![Part::text("Read image /w/shot.png (1440x900)"), Part::image("data:image/jpeg;base64,AAAA")]);
+        let want = json!({"role":"tool","tool_call_id":"c1","content":[
+            {"type":"text","text":"Read image /w/shot.png (1440x900)"},
+            {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}]});
+        assert_eq!(serde_json::to_value(&m).unwrap(), want);
+        let back: Message = serde_json::from_value(want).unwrap();
+        assert_eq!(back.content.as_ref().unwrap().image_count(), 1);
+        let back: Message = serde_json::from_str(r#"{"role":"user","content":"x"}"#).unwrap();
+        assert_eq!(back.content.unwrap().as_text(), Some("x"));
+    }
+
+    #[test]
+    fn flattening_for_text_only_models() {
+        let msgs = vec![Message::text("user", "a"), Message::tool_parts("c", vec![Part::text("line"), Part::image("u")])];
+        let f = flatten_images(&msgs);
+        assert_eq!(f[0].content.as_ref().unwrap().as_text(), Some("a"));
+        assert_eq!(f[1].content.as_ref().unwrap().as_text(), Some("line\n[image attached; this model cannot see it]"));
+        assert_eq!(f[1].tool_call_id.as_deref(), Some("c"));
+    }
+
     #[test]
     fn body_bytes_match_json_macro() {
         let mut a = super::Message::text("assistant", "x");

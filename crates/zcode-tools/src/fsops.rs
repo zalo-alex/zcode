@@ -81,7 +81,20 @@ impl LocalFs {
 
     fn read_i(&self, a: &Value) -> Result<String> {
         let p = self.resolve(s(a, "path")?);
-        let (bytes, canon) = self.read_bytes(&p, 5_000_000)?;
+        let (bytes, canon) = match self.read_bytes(&p, 5_000_000) {
+            Ok(r) => r,
+            Err(e) if e.to_string().starts_with("file too large") => {
+                // an image over the limit is a note for the model, not an error
+                let mut head = [0u8; 12];
+                let n = self.open_read(&p).ok().and_then(|mut f| f.read(&mut head).ok()).unwrap_or(0);
+                if crate::img::sniff(&head[..n]).is_some() {
+                    return Ok(crate::img::too_big_note(self.open_read(&p)?.metadata()?.len() as usize));
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(mime) = crate::img::sniff(&bytes) { return Ok(crate::img::encode_result(mime, &bytes)); }
         if bytes[..bytes.len().min(4096)].contains(&0) { bail!("binary file"); }
         self.note(canon, &bytes);
         let text = String::from_utf8_lossy(&bytes);

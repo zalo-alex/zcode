@@ -26,6 +26,21 @@ fn default_timeout() -> u64 {
     std::env::var("ZCODE_BASH_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(120)
 }
 
+/// Command output: head+tail when large, except an image printed as base64 (it must arrive whole to be usable).
+fn read_output(p: &Path, half: u64) -> String {
+    let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    if len > half * 2 {
+        let mut head = [0u8; 64];
+        let n = std::fs::File::open(p).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+        if crate::img::looks_like_image(&String::from_utf8_lossy(&head[..n])) {
+            // base64 is 4/3 of the file, plus line wrapping; anything beyond this is over the image limit anyway
+            if len > crate::img::MAX_SRC as u64 * 3 / 2 { return crate::img::too_big_note((len * 3 / 4) as usize); }
+            return std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        }
+    }
+    read_head_tail(p, half)
+}
+
 /// Read a file; when large keep the first and last `half` bytes.
 fn read_head_tail(p: &Path, half: u64) -> String {
     let Ok(mut f) = std::fs::File::open(p) else { return String::new() };
@@ -172,7 +187,7 @@ impl LocalSandbox {
                 -1
             }
         };
-        let text = read_head_tail(&out_f, 24_000);
+        let text = read_output(&out_f, 24_000);
         if let Ok(d) = std::fs::read_to_string(&cwd_f) {
             let d = PathBuf::from(d.trim());
             if d.is_dir() { *self.cwd.lock().unwrap() = d; }

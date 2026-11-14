@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod events;
 mod guard;
+mod img;
 mod llm;
 mod peer;
 mod persist;
@@ -114,6 +115,9 @@ struct Common {
     /// Hide the model's reasoning
     #[arg(long, global = true, conflicts_with = "thinking")]
     no_thinking: bool,
+    /// Attach an image to the first message (repeatable; jpeg, png, gif, webp up to 5 MB)
+    #[arg(long, global = true, value_name = "PATH")]
+    image: Vec<std::path::PathBuf>,
     /// Max model steps per turn
     #[arg(long, default_value_t = 60, global = true)]
     max_steps: usize,
@@ -289,6 +293,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
         let (sw, rx) = swarm::Swarm::new(cfg, sc, "lead", lead_sandbox);
         agent.join_swarm_as_lead(sw.clone(), rx);
         swarm = Some(sw);
+    }
+    for p in &common.image {
+        let p = if p.is_absolute() { p.clone() } else { cwd.join(p) };
+        agent.attach_image(&p).map_err(|e| anyhow::anyhow!("--image {e}"))?;
     }
     let res: anyhow::Result<i32> = match prompt {
         Some(p) => {

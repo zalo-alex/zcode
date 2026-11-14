@@ -21,6 +21,7 @@ mod pathguard {
     }
 }
 pub mod frames;
+pub mod img;
 pub mod sandbox;
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub mod container;
@@ -150,10 +151,11 @@ pub async fn run(name: &str, args: &Value, ctx: &Ctx) -> Result<String> {
         "glob" => fs.glob(args).await?,
         "grep" => fs.grep(args).await?,
         "multiedit" => fs.multiedit(args).await?,
-        "bash" => bash(args, ctx).await?,
+        "bash" => { let o = bash(args, ctx).await?; img::from_text_output(&o).unwrap_or(o) }
         "bash_output" => {
             let lines = args["lines"].as_u64().unwrap_or(100) as usize;
-            ctx.sandbox.exec(ExecReq::JobOutput { id: args["id"].as_str().map(String::from), lines }).await?.collect().await.0
+            let o = ctx.sandbox.exec(ExecReq::JobOutput { id: args["id"].as_str().map(String::from), lines }).await?.collect().await.0;
+            img::from_text_output(&o).unwrap_or(o)
         }
         "bash_kill" => ctx.sandbox.exec(ExecReq::JobKill { id: s(args, "id")?.to_string() }).await?.collect().await.0,
         "todoread" => todo_read(ctx),
@@ -175,6 +177,8 @@ pub async fn run(name: &str, args: &Value, ctx: &Ctx) -> Result<String> {
         "task" => return Err(anyhow!("task handled by agent")),
         _ => return Err(anyhow!("unknown tool `{name}`")),
     };
+    // an image result is base64 on purpose: capping it would leave an unusable string
+    if out.starts_with(img::SENTINEL) { return Ok(out); }
     Ok(cap_spill(out, 30_000, ctx))
 }
 
@@ -358,5 +362,26 @@ mod tests {
         let good = json!({"path":"f.txt","edits":[{"old_string":"one","new_string":"1"},{"old_string":"three","new_string":"3"}]});
         run("multiedit", &good, &ctx).await.unwrap();
         assert_eq!(std::fs::read_to_string(d.join("f.txt")).unwrap(), "1\ntwo\n3\n");
+    }
+
+    #[tokio::test]
+    async fn read_on_an_image_returns_an_image_result_not_binary_file() {
+        let d = tmp("img");
+        // magic bytes + padding: sniffed by content, not by extension
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(std::iter::repeat_n(0u8, 100_000));
+        std::fs::write(d.join("pic.dat"), &png).unwrap();
+        let ctx = Ctx::new(d.clone());
+        let o = run("read", &json!({"path":"pic.dat"}), &ctx).await.unwrap();
+        let (mime, b64) = img::parse_result(&o).expect("image result");
+        assert_eq!(mime, "image/png");
+        assert_eq!(img::b64_decode(b64).unwrap(), png, "not capped or truncated");
+        // over the limit: a note, not an error
+        std::fs::write(d.join("big.png"), vec![0x89, b'P', b'N', b'G'].into_iter().chain(std::iter::repeat_n(0u8, 5_100_000)).collect::<Vec<_>>()).unwrap();
+        let o = run("read", &json!({"path":"big.png"}), &ctx).await.unwrap();
+        assert!(o.starts_with("[image not attached"), "{o}");
+        // other binary files still fail
+        std::fs::write(d.join("x.bin"), [0u8, 1, 2, 3]).unwrap();
+        assert!(run("read", &json!({"path":"x.bin"}), &ctx).await.unwrap_err().to_string().contains("binary file"));
     }
 }

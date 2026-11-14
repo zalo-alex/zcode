@@ -11,6 +11,18 @@ pub struct Config {
     pub model: String,
     pub context: usize,
     pub max_output: u32,
+    /// the model accepts images (config `vision`, else guessed from the model name)
+    pub vision: bool,
+}
+
+/// Models known to take image input, by name. Config `vision` (top level or per model) overrides.
+pub fn detect_vision(model: &str) -> bool {
+    let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    const PREFIX: &[&str] = &["claude-", "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-5", "chatgpt-4o", "gemini", "gemma-3", "pixtral", "llava", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qvq", "internvl", "minicpm-v", "llama-3.2-11b-vision", "llama-3.2-90b-vision", "llama-4", "grok-2-vision", "grok-4", "mistral-medium-3", "mistral-small-3"];
+    const ANY: &[&str] = &["-vl-", "-vl", "vision", "claude-", "multimodal"];
+    const NO: &[&str] = &["gpt-4o-audio", "gpt-4o-realtime", "gpt-4o-transcribe", "embedding"];
+    if NO.iter().any(|n| m.contains(n)) { return false; }
+    PREFIX.iter().any(|p| m.starts_with(p)) || ANY.iter().any(|p| m.contains(p)) || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
 }
 
 pub struct Settings {
@@ -77,7 +89,11 @@ fn resolve_with(cfg: &Value, model_ref: &str, use_env: bool) -> Result<Config> {
     };
     let prov = &providers.unwrap()[&prov_id];
     let opts = prov.get("options").unwrap_or(&Value::Null);
-    let limit = prov.get("models").and_then(|m| m.get(&model_id)).and_then(|m| m.get("limit"));
+    let model_cfg = prov.get("models").and_then(|m| m.get(&model_id));
+    let limit = model_cfg.and_then(|m| m.get("limit"));
+    let vision = model_cfg.and_then(|m| m.get("vision")).and_then(|v| v.as_bool())
+        .or_else(|| cfg.get("vision").and_then(|v| v.as_bool()))
+        .unwrap_or_else(|| detect_vision(&model_id));
     Ok(Config {
         base_url: env("ZCODE_BASE_URL")
             .or_else(|| opts.get("baseURL").and_then(|v| v.as_str()).map(String::from))
@@ -89,6 +105,7 @@ fn resolve_with(cfg: &Value, model_ref: &str, use_env: bool) -> Result<Config> {
         model: model_id,
         context: limit.and_then(|l| l.get("context")).and_then(|v| v.as_u64()).unwrap_or(128_000) as usize,
         max_output: limit.and_then(|l| l.get("output")).and_then(|v| v.as_u64()).unwrap_or(8192) as u32,
+        vision,
     })
 }
 
@@ -151,6 +168,17 @@ mod tests {
         let one = json!({"provider":{"only":{"options":{"baseURL":"http://x"}}}});
         assert_eq!(resolve(&one, "just-a-model").unwrap().model, "just-a-model");
         assert_eq!(resolve(&one, "only/org/model").unwrap().model, "org/model");
+    }
+    #[test]
+    fn vision_is_detected_by_name_and_overridable() {
+        for m in ["claude-sonnet-5-5", "anthropic/claude-opus-5-5", "gpt-4o-mini", "gemini-2.5-pro", "qwen-vl-max", "qwen2.5-vl-72b", "llava-1.6"] { assert!(detect_vision(m), "{m}"); }
+        for m in ["deepseek-chat", "qwen3-coder", "llama-3.1-70b", "gpt-4o-audio-preview", "mistral-large"] { assert!(!detect_vision(m), "{m}"); }
+        assert!(!resolve(&cfg(), "a/m1").unwrap().vision);
+        let c = json!({"vision": true, "provider":{"a":{"options":{"baseURL":"http://a"},"models":{"m1":{},"m2":{"vision":false}}}}});
+        assert!(resolve(&c, "a/m1").unwrap().vision);
+        assert!(!resolve(&c, "a/m2").unwrap().vision);
+        let c = json!({"provider":{"a":{"options":{"baseURL":"http://a"},"models":{"claude-x":{"vision":false}}}}});
+        assert!(!resolve(&c, "a/claude-x").unwrap().vision);
     }
     #[test]
     fn permission_allow() {

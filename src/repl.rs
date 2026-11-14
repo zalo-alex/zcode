@@ -3,11 +3,12 @@ use crate::{context, session};
 use crate::style::Paint;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-const HELP: &str = "/help  /clear  /compact  /thinking  /sessions  /status  /todo  /cost  /agents  /model  /exit   (Ctrl-C interrupts a turn)";
+const HELP: &str = "/help  /clear  /compact  /thinking  /sessions  /status  /todo  /cost  /agents  /model  /image <path>  /exit   (Ctrl-C interrupts a turn)";
 
 fn last_assistant_tail(agent: &Agent) -> Option<String> {
-    let m = agent.msgs.iter().rev().find(|m| m.role == "assistant" && m.content.as_ref().is_some_and(|c| !c.trim().is_empty()))?;
-    let c = m.content.as_ref()?.trim();
+    let m = agent.msgs.iter().rev().find(|m| m.role == "assistant" && !m.text_view().trim().is_empty())?;
+    let c = m.text_view();
+    let c = c.trim();
     let start = c.len().saturating_sub(600);
     Some(c[c.ceil_char_boundary(start)..].to_string())
 }
@@ -63,6 +64,16 @@ pub async fn run(mut agent: Agent, resumed: bool) -> anyhow::Result<()> {
                     None => println!("swarm is off (start with --max-workers N)"),
                 },
                 "model" => println!("{}", agent.client.cfg.model),
+                "image" => {
+                    let arg = cmd["image".len()..].trim().trim_matches(|c| c == '"' || c == '\'');
+                    if arg.is_empty() { println!("usage: /image <path>   (attaches to your next message)"); continue; }
+                    let p = std::path::Path::new(arg);
+                    let p = if p.is_absolute() { p.to_path_buf() } else { agent.ctx.cwd().join(p) };
+                    match agent.attach_image(&p) {
+                        Ok(l) => println!("{}", format!("attached {l}{}", if agent.client.cfg.vision { "" } else { " (this model cannot see images)" }).dimmed()),
+                        Err(e) => println!("error: {e}"),
+                    }
+                }
                 _ => println!("unknown command; {HELP}"),
             }
             continue;
