@@ -53,7 +53,11 @@ impl Session {
         std::fs::create_dir_all(dir())?;
         let path = dir().join(format!("{id}.jsonl"));
         let header = if path.exists() {
-            std::fs::read_to_string(&path)?.lines().next().filter(|l| l.contains("zcode_session")).map(String::from)
+            {
+                let mut first = String::new();
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(std::fs::File::open(&path)?), &mut first)?;
+                Some(first.lines().next().unwrap_or("").to_string())
+            }.filter(|l| l.contains("zcode_session"))
                 .unwrap_or_else(|| header_of(&id, cwd, model))
         } else {
             let h = header_of(&id, cwd, model);
@@ -167,31 +171,59 @@ pub fn items(msgs: &[Message]) -> Vec<Value> {
     out
 }
 
-fn read_info(p: &Path) -> Option<Info> {
-    let text = std::fs::read_to_string(p).ok()?;
-    let h: Value = serde_json::from_str(text.lines().next()?).ok()?;
+/// `want_count`: exact message count (streams the file); otherwise only "0 or 1+" (reads two lines).
+fn read_info(p: &Path, mtime: std::time::SystemTime, want_count: bool) -> Option<Info> {
+    use std::io::{BufRead, BufReader};
+    let mut r = BufReader::new(std::fs::File::open(p).ok()?);
+    let mut first = String::new();
+    r.read_line(&mut first).ok()?;
+    let h: Value = serde_json::from_str(first.lines().next()?).ok()?;
     let h = h.get("zcode_session")?;
+    let mut messages = 0;
+    if want_count {
+        let mut buf = [0u8; 64 * 1024];
+        let mut last = b'\n';
+        // lines after the header: count newlines, plus a final unterminated line
+        loop {
+            let n = std::io::Read::read(&mut r, &mut buf).ok()?;
+            if n == 0 { break; }
+            messages += buf[..n].iter().filter(|&&b| b == b'\n').count();
+            last = buf[n - 1];
+        }
+        if last != b'\n' { messages += 1; }
+        if !first.ends_with('\n') { messages = 0; }
+    } else {
+        let mut rest = String::new();
+        if r.read_line(&mut rest).ok()? > 0 { messages = 1; }
+    }
     Some(Info {
         id: h["id"].as_str()?.to_string(),
         cwd: h["cwd"].as_str().unwrap_or("").to_string(),
         model: h["model"].as_str().unwrap_or("").to_string(),
-        mtime: std::fs::metadata(p).ok()?.modified().ok()?,
-        messages: text.lines().count().saturating_sub(1),
+        mtime,
+        messages,
     })
 }
 
-pub fn list() -> Vec<Info> {
-    let mut v: Vec<Info> = std::fs::read_dir(dir()).into_iter().flatten().flatten()
+/// Session files newest first, by mtime only (no file contents read).
+fn files_by_mtime() -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir()).into_iter().flatten().flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| read_info(&e.path())).collect();
-    v.sort_by_key(|i| std::cmp::Reverse(i.mtime));
+        .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?))).collect();
+    v.sort_by_key(|f| std::cmp::Reverse(f.1));
     v
+}
+
+/// The `n` most recently updated sessions; only those files are read.
+pub fn list_top(n: usize) -> Vec<Info> {
+    files_by_mtime().into_iter().filter_map(|(p, m)| read_info(&p, m, true)).take(n).collect()
 }
 
 /// Most recently updated session whose working directory is `cwd`.
 pub fn latest_for_cwd(cwd: &Path) -> Option<String> {
     let want = cwd.display().to_string();
-    list().into_iter().find(|i| i.cwd == want && i.messages > 0 && !i.id.contains('.')).map(|i| i.id)
+    files_by_mtime().into_iter().filter_map(|(p, m)| read_info(&p, m, false))
+        .find(|i| i.cwd == want && i.messages > 0 && !i.id.contains('.')).map(|i| i.id)
 }
 
 #[cfg(test)]

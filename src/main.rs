@@ -317,7 +317,7 @@ async fn settle(agent: &mut Agent, first: anyhow::Result<agent::Outcome>) -> any
 }
 
 fn list_sessions() -> anyhow::Result<i32> {
-    let v = session::list();
+    let v = session::list_top(50);
     if v.is_empty() { println!("no sessions"); }
     for i in v.iter().take(50) {
         let age = i.mtime.elapsed().map(|d| d.as_secs()).unwrap_or(0);

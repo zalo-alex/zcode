@@ -42,7 +42,7 @@ pub async fn run(mut agent: Agent, resumed: bool) -> anyhow::Result<()> {
                     Err(e) => println!("error: {e}"),
                 },
                 "sessions" => {
-                    for i in session::list().iter().take(10) { println!("{}  {} msgs  {}", i.id, i.messages, i.cwd); }
+                    for i in session::list_top(10).iter() { println!("{}  {} msgs  {}", i.id, i.messages, i.cwd); }
                     println!("resume with: zcode --session <id>   or   zcode --continue");
                 }
                 "status" => println!("session {} · {} msgs · ~{}/{} tokens · {} · thinking {} · cwd {}", agent.sid(), agent.msgs.len() - 1,
