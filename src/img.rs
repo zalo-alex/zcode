@@ -134,19 +134,25 @@ pub fn load_attachment(path: &Path, vision: bool) -> Result<Attachment, String> 
     if !meta.is_file() { return Err(format!("{}: not a file", path.display())); }
     if meta.len() as usize > MAX_SRC { return Err(format!("{}: {}", path.display(), too_big_note(meta.len() as usize))); }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mime = sniff(&bytes).ok_or_else(|| format!("{}: not a supported image (jpeg, png, gif, webp)", path.display()))?;
+    attachment_from_bytes(&path.display().to_string(), &bytes, vision)
+}
+
+/// An attachment from raw bytes (`label` names it in messages): sniff, size cap, downscale.
+pub fn attachment_from_bytes(label: &str, bytes: &[u8], vision: bool) -> Result<Attachment, String> {
+    if bytes.len() > MAX_SRC { return Err(format!("{label}: {}", too_big_note(bytes.len()))); }
+    let mime = sniff(bytes).ok_or_else(|| format!("{label}: not a supported image (jpeg, png, gif, webp)"))?;
     if !vision {
-        let line = match dims(&bytes, mime) { Some((w, h)) => format!("{} ({w}x{h})", path.display()), None => path.display().to_string() };
+        let line = match dims(bytes, mime) { Some((w, h)) => format!("{label} ({w}x{h})"), None => label.to_string() };
         return Ok(Attachment { line, part: None });
     }
-    let i = process(mime, &bytes).map_err(|n| format!("{}: {n}", path.display()))?;
-    Ok(Attachment { line: format!("{} ({}x{})", path.display(), i.w, i.h), part: Some(Part::image(i.url)) })
+    let i = process(mime, bytes).map_err(|n| format!("{label}: {n}"))?;
+    Ok(Attachment { line: format!("{label} ({}x{})", i.w, i.h), part: Some(Part::image(i.url)) })
 }
 
 /// The user message for `input` with attachments (plain text when there are none).
 pub fn user_message(input: &str, atts: Vec<Attachment>) -> Message {
     if atts.is_empty() { return Message::text("user", input); }
-    let mut parts = vec![Part::text(input)];
+    let mut parts = if input.trim().is_empty() { vec![] } else { vec![Part::text(input)] };
     for a in atts {
         match a.part {
             Some(p) => parts.push(p),

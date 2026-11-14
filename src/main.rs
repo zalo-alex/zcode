@@ -250,8 +250,17 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
     // a running daemon takes over `zcode run` (auto-approve runs only: a daemon cannot prompt a terminal); otherwise embedded
     if is_run && auto && !common.cont && common.session.is_none() && std::env::var_os("ZCODE_NO_DAEMON").is_none() && let Some(p) = &prompt {
         let (mode_s, pol, mw) = daemon_request(&common, &settings, &cwd, auto)?;
+        let mut images = vec![];
+        for f in &common.image {
+            let f = if f.is_absolute() { f.clone() } else { cwd.join(f) };
+            // the same checks as the embedded `--image`, so a bad file fails the same way (the daemon does the downscaling)
+            let bytes = std::fs::read(&f).map_err(|e| anyhow::anyhow!("--image {}: {e}", f.display()))?;
+            if bytes.len() > tools::img::MAX_SRC { anyhow::bail!("--image {}: {}", f.display(), tools::img::too_big_note(bytes.len())); }
+            if tools::img::sniff(&bytes).is_none() { anyhow::bail!("--image {}: not a supported image (jpeg, png, gif, webp)", f.display()); }
+            images.push(tools::img::b64_encode(&bytes));
+        }
         let req = client::Req { settings: &settings, cwd: &cwd, sandbox: mode_s, require_sandbox: common.require_sandbox, policy: pol, max_time: max_time.map(|d| d.as_secs()),
-            max_steps: common.max_steps, max_tokens: common.max_tokens, max_workers: mw, format: common.format, thinking, prompt: p };
+            max_steps: common.max_steps, max_tokens: common.max_tokens, max_workers: mw, format: common.format, thinking, prompt: p, images };
         if let Some(code) = client::try_run(req).await { return Ok(code); }
     }
     let client = Arc::new(llm::Client::new(settings.main));

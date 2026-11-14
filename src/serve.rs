@@ -602,12 +602,31 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
         "prompt" => {
             let inst = d.find(app, str_of(req, "instance")?)?;
             let text = str_of(req, "text")?.to_string();
-            if text.trim().is_empty() { return Err("empty prompt".into()); }
+            // `images`: [{"data": "<base64 jpeg|png|gif|webp>"}, ...]; the client reads its own files, the daemon never opens a client path
+            let raw: Vec<String> = match req.get("images") {
+                None | Some(Value::Null) => vec![],
+                Some(Value::Array(a)) => a.iter().map(|x| x["data"].as_str().map(String::from).ok_or("images[] needs a `data` string (base64)")).collect::<Result<_, _>>()?,
+                Some(_) => return Err("images must be an array".into()),
+            };
+            if raw.len() > crate::img::MAX_PER_REQUEST { return Err(format!("too many images (max {})", crate::img::MAX_PER_REQUEST)); }
+            if text.trim().is_empty() && raw.is_empty() { return Err("empty prompt".into()); }
             d.ensure_built(&inst).await?;
             // a person typed: re-arm the agent-to-agent message caps and the reply-chain counter
             if let Some(sw) = inst.swarm.lock().unwrap().clone() { sw.reset_caps(); }
-            if let Some(a) = inst.agent.lock().unwrap().as_mut() { a.last_hops = 0; }
-            d.start_turn(&inst, text, Some("client"))?;
+            // no agent = busy, crashed or not ready: `start_turn` below says which
+            let vision = inst.agent.lock().unwrap().as_mut().map(|a| { a.last_hops = 0; a.client.cfg.vision });
+            if let (false, Some(vision)) = (raw.is_empty(), vision) {
+                // decoding and downscaling is CPU work: keep it off the connection's async task
+                let atts = tokio::task::spawn_blocking(move || raw.iter().enumerate().map(|(i, b)| {
+                    let bytes = zcode_tools::img::b64_decode(b).ok_or_else(|| format!("image {}: invalid base64", i + 1))?;
+                    crate::img::attachment_from_bytes(&format!("image {}", i + 1), &bytes, vision)
+                }).collect::<Result<Vec<_>, String>>()).await.map_err(|e| e.to_string())??;
+                match inst.agent.lock().unwrap().as_mut() { Some(a) => for x in atts { a.attach(x); }, None => return Err("instance is busy".into()) }
+            }
+            if let Err(e) = d.start_turn(&inst, text, Some("client")) {
+                if let Some(a) = inst.agent.lock().unwrap().as_mut() { a.clear_attachments(); }
+                return Err(e);
+            }
             Ok(json!({}))
         }
         "build" => {

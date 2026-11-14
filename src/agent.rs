@@ -155,6 +155,10 @@ impl Agent {
         Ok(line)
     }
 
+    /// Queue an already-built attachment (daemon `prompt` with images).
+    pub fn attach(&mut self, a: crate::img::Attachment) { self.pending_images.push(a); }
+    pub fn clear_attachments(&mut self) { self.pending_images.clear(); }
+
     pub fn sid(&self) -> &str { self.session.as_ref().map(|s| s.id.as_str()).unwrap_or("") }
 
     /// Attach a persistent session; with `resume` the stored conversation replaces the fresh one.

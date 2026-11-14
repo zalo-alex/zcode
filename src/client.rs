@@ -21,10 +21,12 @@ pub struct Req<'a> {
     pub format: Format,
     pub thinking: bool,
     pub prompt: &'a str,
+    /// image files for the first message, as base64
+    pub images: Vec<String>,
 }
 
 fn provider(c: &crate::config::Config) -> Value {
-    json!({"options": {"baseURL": c.base_url, "apiKey": c.api_key}, "models": {&c.model: {"limit": {"context": c.context, "output": c.max_output}}}})
+    json!({"options": {"baseURL": c.base_url, "apiKey": c.api_key}, "models": {&c.model: {"limit": {"context": c.context, "output": c.max_output}, "vision": c.vision}}})
 }
 
 /// The client's own resolved configuration (its env and files already applied): the daemon never uses its own.
@@ -63,7 +65,7 @@ pub async fn try_run(r: Req<'_>) -> Option<i32> {
         eprintln!("zcode: daemon refused the run ({}); running embedded", ack["err"].as_str().unwrap_or("?"));
         return None;
     }
-    for (op, extra) in [("attach", json!({})), ("prompt", json!({"text": r.prompt}))] {
+    for (op, extra) in [("attach", json!({})), ("prompt", if r.images.is_empty() { json!({"text": r.prompt}) } else { json!({"text": r.prompt, "images": r.images.iter().map(|b| json!({"data": b})).collect::<Vec<_>>()}) })] {
         let mut v = json!({"req": next(), "op": op, "instance": name});
         if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) { for (k, x) in e { o.insert(k.clone(), x.clone()); } }
         call(&mut stream, v).await.ok()?;
