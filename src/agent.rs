@@ -291,7 +291,7 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
             if let Some(sd) = self.swarm.as_ref().and_then(|s| s.budget.deadline) { deadline = Some(deadline.map_or(sd, |d| d.min(sd))); }
             let mut final_text = String::new();
             let (mut nudges, mut budget_used, mut overflow_tries, mut length_conts) = (0usize, 0u64, 0usize, 0usize);
-            let mut seen: HashMap<String, usize> = HashMap::new();
+            let mut seen: HashMap<u64, usize> = HashMap::new();
             let (mut explore, mut explore_nudged) = (0usize, false);
             let max_steps = self.limits.max_steps;
             for step in 0..max_steps {
@@ -426,8 +426,8 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
         })
     }
 
-    async fn run_calls(&mut self, calls: &[ToolCall], seen: &mut HashMap<String, usize>) -> Vec<String> {
-        let parsed: Vec<Result<Value, String>> = calls.iter().map(|c| parse_args(&c.function.arguments)).collect();
+    async fn run_calls(&mut self, calls: &[ToolCall], seen: &mut HashMap<u64, usize>) -> Vec<String> {
+        let mut parsed: Vec<Result<Value, String>> = calls.iter().map(|c| parse_args(&c.function.arguments)).collect();
         for (c, p) in calls.iter().zip(&parsed) {
             if self.human() { eprintln!("{} {}", "▸".cyan(), summarize(&c.function.name, p.as_ref().ok()).dimmed()); }
             else if self.json() && (self.stream || self.daemon) {
@@ -441,7 +441,7 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
         let cwd = self.ctx.cwd();
         let mut verdict: Vec<Option<String>> = vec![];
         for (c, p) in calls.iter().zip(&parsed) {
-            let n = seen.entry(format!("{}{}", c.function.name, c.function.arguments)).or_insert(0);
+            let n = seen.entry(call_key(c)).or_insert(0);
             *n += 1;
             let repeated = *n >= MAX_REPEAT && !matches!(c.function.name.as_str(), "bash" | "bash_output" | "todowrite" | "todoread" | "wait");
             verdict.push(match p {
@@ -455,7 +455,7 @@ You are agent `{name}` in the group `{group}`. Other agents, each used by a pers
         let mut futs = vec![];
         for (i, c) in calls.iter().enumerate() {
             if let Some(v) = &verdict[i] { out[i] = format!("Error: {v}"); continue; }
-            let a = parsed[i].clone().unwrap();
+            let a = std::mem::replace(&mut parsed[i], Err(String::new())).unwrap();
             let name = c.function.name.clone();
             if matches!(name.as_str(), "spawn" | "send" | "wait") {
                 out[i] = self.swarm_tool(&name, &a).await;
@@ -614,4 +614,14 @@ mod limit_tests {
         assert_eq!(unlimited_tokens(5000), 5000);
         assert_eq!(Limits::default().max_tokens, unlimited_tokens(0));
     }
+}
+
+/// Identity of a call (name + arguments) for repeat detection, without keeping the arguments alive.
+fn call_key(c: &ToolCall) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    c.function.name.hash(&mut h);
+    0u8.hash(&mut h);
+    c.function.arguments.hash(&mut h);
+    h.finish()
 }

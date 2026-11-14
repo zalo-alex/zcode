@@ -5,30 +5,33 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
+    // fields (here and below) stay in alphabetical order: the request bytes equal the old sorted-key `json!` output
+    pub function: FnCall,
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
-    pub function: FnCall,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct FnCall {
-    pub name: String,
     pub arguments: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
-    pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl Message {
@@ -90,6 +93,20 @@ fn upstream_err_re() -> &'static Regex {
     R.get_or_init(|| Regex::new(r"(?i)^\s*\[[^\]]*(upstream|provider|gateway)[^\]]*error[^\]]*\]\s*$").unwrap())
 }
 
+/// Request body; fields in alphabetical order so the bytes equal what a `json!` map (sorted keys) produced.
+#[derive(serde::Serialize)]
+struct ChatBody<'a> {
+    max_tokens: u32,
+    messages: &'a [Message],
+    model: &'a str,
+    stream: bool,
+    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+}
+#[derive(serde::Serialize)]
+struct StreamOptions { include_usage: bool }
+
 impl Client {
     pub fn new(cfg: Config) -> Self {
         let idle: f64 = std::env::var("ZCODE_STREAM_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120.0);
@@ -134,16 +151,8 @@ impl Client {
     }
 
     async fn chat_once(&self, msgs: &[Message], tools: &[Value], on_delta: &mut impl FnMut(Delta)) -> Result<Reply> {
-        let mut body = json!({
-            "model": self.cfg.model,
-            "messages": msgs,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-            "max_tokens": self.cfg.max_output,
-        });
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
+        let body = ChatBody { max_tokens: self.cfg.max_output, messages: msgs, model: &self.cfg.model, stream: true,
+            stream_options: StreamOptions { include_usage: true }, tools: if tools.is_empty() { None } else { Some(tools) } };
         let mut rb = self.http.post(format!("{}/chat/completions", self.cfg.base_url)).json(&body);
         if !self.cfg.api_key.is_empty() {
             rb = rb.bearer_auth(&self.cfg.api_key);
@@ -238,6 +247,21 @@ pub fn apply_chunk(reply: &mut Reply, v: &Value, on_delta: &mut impl FnMut(Delta
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn body_bytes_match_json_macro() {
+        let mut a = super::Message::text("assistant", "x");
+        a.tool_calls = Some(vec![super::ToolCall { id: "c".into(), kind: "function".into(), function: super::FnCall { name: "n".into(), arguments: "{}".into() } }]);
+        let msgs = vec![super::Message::text("user", "hi \u{e9}"), a, super::Message::tool("c", "out")];
+        let tools = vec![json!({"type":"function","function":{"name":"x","parameters":{"b":1,"a":2}}})];
+        for tl in [&tools[..], &[]] {
+            let mut want = json!({"model":"m","messages":msgs,"stream":true,"stream_options":{"include_usage":true},"max_tokens":7});
+            if !tl.is_empty() { want["tools"] = json!(tl); }
+            let got = super::ChatBody { max_tokens: 7, messages: &msgs, model: "m", stream: true, stream_options: super::StreamOptions { include_usage: true },
+                tools: if tl.is_empty() { None } else { Some(tl) } };
+            assert_eq!(serde_json::to_vec(&got).unwrap(), serde_json::to_vec(&want).unwrap());
+        }
+    }
+
     use super::*;
     #[test]
     fn assembles_tool_deltas() {
