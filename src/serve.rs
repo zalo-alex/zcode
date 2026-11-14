@@ -579,6 +579,22 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             let (out, done) = stream.collect().await;
             Ok(json!({"code": done.code, "timed_out": done.timed_out, "output": out}))
         }
+        "history" => {
+            // the instance's conversation (or a worker's with `agent`) as UI items, read from its session file: no filesystem access for the client,
+            // and it works before the instance is built and after a daemon restart
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            let sid = match req["agent"].as_str() {
+                Some(a) if !valid_name(a) => return Err("invalid agent name".into()),
+                Some(a) if a != inst.name => format!("{}.{a}", inst.p.session),
+                _ => inst.p.session.clone(),
+            };
+            let all = session::load_by_id(&sid).map(|m| session::items(&m)).unwrap_or_default();
+            let total = all.len();
+            let end = req["before"].as_u64().map(|b| (b as usize).min(total)).unwrap_or(total);
+            let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 1000) as usize;
+            let first = end.saturating_sub(limit);
+            Ok(json!({"items": &all[first..end], "first": first, "total": total}))
+        }
         "thinking" => {
             // show / hide the model's reasoning for this instance (takes effect from its next turn); no `on` = just report
             let inst = d.find(app, str_of(req, "instance")?)?;

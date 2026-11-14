@@ -161,3 +161,70 @@ fn status_reports_the_turn_in_flight_the_queue_and_the_last_event() {
 }
 
 fn common_now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 }
+
+fn sigkill(d: &mut Daemon) { let _ = d.child.kill(); let _ = d.child.wait(); }
+
+#[test]
+fn history_reads_an_unbuilt_instances_session_and_pages_backwards() {
+    let e = Env::new("ev_hist_seed");
+    let llm = FakeLlm::start_fn(|_| text("unused"));
+    let d = start(&e, json!({}), &[]);
+    let dir = d.home.join("data/zcode/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = vec![json!({"zcode_session": {"id": "ses_seed", "cwd": e.cwd, "model": "m", "created": 1}}).to_string()];
+    for i in 0..10 { lines.push(json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("m{i}")}).to_string()); }
+    std::fs::write(dir.join("ses_seed.jsonl"), lines.join("\n") + "\n").unwrap();
+    let mut c = Client::connect(&d);
+    create(&mut c, "h", &e.cwd, &llm, json!({"session": "ses_seed"}));
+    // nothing was built: the answer comes from the file alone, and building was not needed
+    let all = c.ok("history", json!({"instance": "h"}));
+    assert_eq!((all["total"].as_u64(), all["first"].as_u64()), (Some(10), Some(0)));
+    assert_eq!(all["items"][0], json!({"k": "user", "text": "m0"}));
+    assert_eq!(all["items"][1], json!({"k": "text", "text": "m1"}));
+    assert_eq!(c.ok("status", json!({"instance": "h"}))["instances"][0]["built"], false);
+    let last = c.ok("history", json!({"instance": "h", "limit": 3}));
+    assert_eq!((last["first"].as_u64(), last["items"].as_array().unwrap().len()), (Some(7), 3));
+    assert_eq!(last["items"][2]["text"], "m9");
+    let prev = c.ok("history", json!({"instance": "h", "before": 7, "limit": 3}));
+    assert_eq!((prev["first"].as_u64(), prev["total"].as_u64()), (Some(4), Some(10)));
+    assert_eq!(prev["items"][0]["text"], "m4");
+    assert_eq!(prev["items"][2]["text"], "m6");
+    let edge = c.ok("history", json!({"instance": "h", "before": 2, "limit": 50}));
+    assert_eq!((edge["first"].as_u64(), edge["items"].as_array().unwrap().len()), (Some(0), 2));
+    assert_eq!(c.ok("history", json!({"instance": "h", "limit": 99999}))["items"].as_array().unwrap().len(), 10);
+    // an instance without a session file yet has an empty history, an unknown one is an error
+    create(&mut c, "fresh", &e.cwd, &llm, json!({}));
+    assert_eq!(c.ok("history", json!({"instance": "fresh"}))["total"], 0);
+    assert_eq!(c.call("history", json!({"instance": "nope"}))["ok"], false);
+}
+
+#[test]
+fn history_pairs_tool_calls_and_survives_a_restart() {
+    let e = Env::new("ev_hist_restart");
+    let llm = FakeLlm::start_fn(|r| match n_assist(r) {
+        0 => tool("bash", json!({"command": "echo hello-history"})),
+        _ => text("all done"),
+    });
+    let mut d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "h", &e.cwd, &llm, json!({}));
+    c.ok("attach", json!({"instance": "h"}));
+    c.ok("prompt", json!({"instance": "h", "text": "run it"}));
+    c.wait("turn", turn_end("h"));
+    let live = c.ok("history", json!({"instance": "h"}));
+    let kinds = |h: &Value| h["items"].as_array().unwrap().iter().map(|i| i["k"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(kinds(&live), ["user", "tool", "text"], "{live}");
+    let t = &live["items"][1];
+    assert_eq!((t["tool"].as_str(), t["input"]["command"].as_str(), t["ok"].as_bool()), (Some("bash"), Some("echo hello-history"), Some(true)));
+    assert!(t["output"].as_str().unwrap().contains("hello-history"));
+    assert!(t["id"].as_str().unwrap().starts_with("call_"));
+    assert_eq!(live["items"][2]["text"], "all done");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    drop(c);
+    sigkill(&mut d);
+    // a new daemon: the instance is restored but not built; the history is the same
+    let d2 = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d2);
+    let again = c.ok("history", json!({"instance": "h"}));
+    assert_eq!(again["items"], live["items"]);
+}

@@ -95,7 +95,7 @@ Every event has `type`, `timestamp` (ms) and `sessionID`.
 
 ### Daemon-only events
 
-Over the daemon socket (`zcode serve`, see `DAEMON.md`) the same events carry `instance`, `agent` and `seq`, plus events the embedded stream does not have: `user`, `tool_start`, `partial`, `text_delta`, `reasoning_delta`, `incoming`, `turn_end`, `restored`, `closed`, `warning`. `zcode run --format json` drops `user`, `tool_start` and `partial` so its output stays identical to the embedded one.
+Over the daemon socket (`zcode serve`, see `DAEMON.md`) the same events carry `instance`, `agent` and `seq`, plus events the embedded stream does not have: `user`, `tool_start`, `partial`, `text_delta`, `reasoning_delta`, `incoming`, `turn_end`, `restored`, `closed`, `warning`; and the `history` op returns the session as `{k:user|text|tool}` items (see `DAEMON.md`). `zcode run --format json` drops `user`, `tool_start` and `partial` so its output stays identical to the embedded one.
 
 ## Sessions
 

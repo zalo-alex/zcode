@@ -100,6 +100,73 @@ impl Session {
     }
 }
 
+/// Stored conversation of a session id, without creating or touching anything (`None` when the id is invalid or has no file).
+pub fn load_by_id(id: &str) -> Option<Vec<Message>> {
+    if !valid_id(id) && !id.split_once('.').is_some_and(|(b, a)| valid_id(b) && valid_id(a)) { return None; }
+    let text = std::fs::read_to_string(dir().join(format!("{id}.jsonl"))).ok()?;
+    Some(text.lines().filter(|l| !l.contains("\"zcode_session\"")).filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+/// Longest text/output/input string a history item carries.
+pub const ITEM_CAP: usize = 12000;
+
+/// `(s, false)` when it fits, else its first `ITEM_CAP` chars and `true`.
+fn cut(s: &str) -> (String, bool) {
+    if s.len() <= ITEM_CAP { return (s.to_string(), false); }
+    match s.char_indices().nth(ITEM_CAP) { Some((i, _)) => (s[..i].to_string(), true), None => (s.to_string(), false) }
+}
+
+fn cut_value(v: &Value, any: &mut bool) -> Value {
+    match v {
+        Value::String(s) => { let (c, was) = cut(s); *any |= was; Value::String(c) }
+        Value::Array(a) => Value::Array(a.iter().map(|x| cut_value(x, any)).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), cut_value(x, any))).collect()),
+        _ => v.clone(),
+    }
+}
+
+/// The conversation as UI items: `{k:"user",text}`, `{k:"text",text}`, `{k:"tool",id,tool,input,output,ok}`.
+/// Tool results are paired with their calls by id (in order when an id does not match); a call without a result yet has
+/// `output` and `ok` null. Anything cut to `ITEM_CAP` chars gets `"cut": true`. System messages are not items.
+pub fn items(msgs: &[Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = vec![];
+    let mut pending: Vec<(usize, String)> = vec![]; // (index in `out`, call id) still waiting for a result
+    for m in msgs {
+        match m.role.as_str() {
+            "user" | "assistant" => {
+                let k = if m.role == "user" { "user" } else { "text" };
+                if let Some(c) = m.content.as_deref().filter(|c| !c.is_empty()) {
+                    let (text, was) = cut(c);
+                    let mut it = json!({"k": k, "text": text});
+                    if was { it["cut"] = json!(true); }
+                    out.push(it);
+                }
+                for c in m.tool_calls.iter().flatten() {
+                    let mut was = false;
+                    let input = serde_json::from_str::<Value>(&c.function.arguments).map(|v| cut_value(&v, &mut was)).unwrap_or_else(|_| { let (s, w) = cut(&c.function.arguments); was = w; Value::String(s) });
+                    let mut it = json!({"k": "tool", "id": c.id, "tool": c.function.name, "input": input, "output": Value::Null, "ok": Value::Null});
+                    if was { it["cut"] = json!(true); }
+                    pending.push((out.len(), c.id.clone()));
+                    out.push(it);
+                }
+            }
+            "tool" => {
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                let slot = pending.iter().position(|p| p.1 == id).or(if pending.is_empty() { None } else { Some(0) });
+                let Some(s) = slot else { continue };
+                let (i, _) = pending.remove(s);
+                let body = m.content.as_deref().unwrap_or("");
+                let (output, was) = cut(body);
+                out[i]["output"] = json!(output);
+                out[i]["ok"] = json!(!body.starts_with("Error:"));
+                if was { out[i]["cut"] = json!(true); }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn read_info(p: &Path) -> Option<Info> {
     let text = std::fs::read_to_string(p).ok()?;
     let h: Value = serde_json::from_str(text.lines().next()?).ok()?;
@@ -130,6 +197,33 @@ pub fn latest_for_cwd(cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(id: &str, name: &str, args: &str) -> crate::llm::ToolCall { crate::llm::ToolCall { id: id.into(), kind: "function".into(), function: crate::llm::FnCall { name: name.into(), arguments: args.into() } } }
+
+    #[test]
+    fn items_pair_results_by_id_then_by_order_and_cut_big_texts() {
+        let mut a = Message::text("assistant", "looking");
+        a.tool_calls = Some(vec![call("c1", "read", "{\"path\":\"a\"}"), call("c2", "bash", "{\"command\":\"ls\"}"), call("c3", "ls", "not json")]);
+        let big = "y".repeat(ITEM_CAP + 5);
+        let msgs = vec![Message::text("system", "sys"), Message::text("user", "go"), a, Message::tool("c2", "Error: boom"), Message::tool("c1", big.as_str()), Message::tool("weird-id", "by order")];
+        let it = items(&msgs);
+        assert_eq!(it.iter().map(|i| i["k"].as_str().unwrap()).collect::<Vec<_>>(), ["user", "text", "tool", "tool", "tool"]);
+        assert_eq!((it[2]["id"].as_str(), it[2]["ok"].as_bool(), it[2]["cut"].as_bool()), (Some("c1"), Some(true), Some(true)));
+        assert_eq!(it[2]["output"].as_str().unwrap().len(), ITEM_CAP);
+        assert_eq!((it[3]["output"].as_str(), it[3]["ok"].as_bool()), (Some("Error: boom"), Some(false)));
+        assert_eq!((it[4]["output"].as_str(), it[4]["input"].as_str()), (Some("by order"), Some("not json")));
+        assert_eq!(it[2]["input"]["path"], "a");
+        // a call with no result yet
+        let mut b = Message::text("assistant", "");
+        b.tool_calls = Some(vec![call("p", "bash", "{}")]);
+        let it = items(&[b]);
+        assert!(it[0]["output"].is_null() && it[0]["ok"].is_null());
+    }
+
+    #[test]
+    fn load_by_id_rejects_bad_ids() {
+        assert!(load_by_id("../x").is_none() && load_by_id("").is_none() && load_by_id("a/b.c").is_none());
+    }
 
     #[test]
     fn id_validation_blocks_traversal() {
