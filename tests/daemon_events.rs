@@ -270,3 +270,68 @@ fn cancel_drops_queued_messages_and_is_harmless_when_idle() {
     c.ok("send", json!({"instance": "k", "to": "k", "text": "fresh-one"}));
     c.wait("woken for the fresh message", |x| x["type"] == "incoming" && x["text"] == "fresh-one");
 }
+
+fn partials(events: &[Value]) -> Vec<&Value> { events.iter().filter(|x| x["type"] == "partial").collect() }
+
+#[test]
+fn attaching_mid_step_with_catch_up_gets_the_partial_output_first() {
+    let e = Env::new("ev_partial");
+    let llm = FakeLlm::start_fn(|_| Script::PartialStall("pondering hard".into(), "half an ans".into(), 3));
+    let d = start(&e, json!({}), &[]);
+    let mut a = Client::connect(&d);
+    create(&mut a, "m", &e.cwd, &llm, json!({"stream": true, "thinking": true}));
+    // idle: catch_up sends nothing
+    let idle = a.ok("attach", json!({"instance": "m", "since": 0, "catch_up": true}));
+    assert_eq!(idle["partial"], false);
+    a.drain(200);
+    assert!(partials(&a.events).is_empty());
+    a.ok("prompt", json!({"instance": "m", "text": "go"}));
+    a.wait("text streaming", |x| x["type"] == "text_delta");
+    a.wait("reasoning streaming", |x| x["type"] == "reasoning_delta");
+    // a second client joins in the middle of the step, at the current counter
+    let mut b = Client::connect(&d);
+    let now = status_of(&mut b, "m")["events"].as_u64().unwrap();
+    let r = b.ok("attach", json!({"instance": "m", "since": now, "catch_up": true}));
+    assert_eq!(r["partial"], true);
+    let p = b.wait("partial", |x| x["type"] == "partial");
+    assert_eq!((p["text"].as_str(), p["reasoning"].as_str(), p["step"].as_u64()), (Some("half an ans"), Some("pondering hard"), Some(1)), "{p}");
+    assert_eq!((p["instance"].as_str(), p["agent"].as_str()), (Some("m"), Some("m")));
+    assert!(p["tools"].as_array().unwrap().is_empty());
+    assert!(p["timestamp"].as_u64().is_some() && p["seq"].as_u64().unwrap() >= now);
+    // without catch_up the same attach shows nothing of the step so far
+    let mut c = Client::connect(&d);
+    let r = c.ok("attach", json!({"instance": "m", "since": now}));
+    assert_eq!(r["partial"], false);
+    c.drain(300);
+    assert!(partials(&c.events).is_empty());
+}
+
+#[test]
+fn partial_lists_the_tools_of_the_step_and_does_not_replay_the_steps_own_events() {
+    let e = Env::new("ev_partial_tools");
+    let llm = FakeLlm::start_fn(|r| match n_assist(r) {
+        0 => tool("bash", json!({"command": "sleep 3"})),
+        _ => text("over"),
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut a = Client::connect(&d);
+    create(&mut a, "m", &e.cwd, &llm, json!({}));
+    a.ok("attach", json!({"instance": "m"}));
+    a.ok("prompt", json!({"instance": "m", "text": "go"}));
+    a.wait("tool started", |x| x["type"] == "tool_start");
+    let mut b = Client::connect(&d);
+    // an older cursor: the earlier events replay, but the in-flight step's tool_start is replaced by the snapshot
+    let r = b.ok("attach", json!({"instance": "m", "since": 0, "catch_up": true}));
+    assert_eq!(r["partial"], true);
+    let p = b.wait("partial", |x| x["type"] == "partial");
+    let t = &p["tools"][0];
+    assert_eq!((t["callID"].as_str(), t["tool"].as_str(), t["done"].as_bool()), (Some("call_0_bash"), Some("bash"), Some(false)), "{p}");
+    assert_eq!(t["input"]["command"], "sleep 3");
+    assert!(t["summary"].as_str().unwrap().contains("sleep 3"));
+    assert!(!b.events.iter().any(|x| x["type"] == "tool_start"), "{:?}", b.events);
+    assert!(b.events.iter().any(|x| x["type"] == "user" || x["type"] == "step_start"));
+    // the live events that follow are the step's end: the tool result, then the final answer
+    let end = b.wait("tool result", |x| x["type"] == "tool_use");
+    assert_eq!(end["part"]["callID"], "call_0_bash");
+    b.wait("turn end", turn_end("m"));
+}

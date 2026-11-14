@@ -22,6 +22,8 @@ pub enum Script {
     Empty,
     /// send headers + first byte, then hang for N seconds
     Stall(u64),
+    /// (reasoning, text, seconds): stream the reasoning and text, then hang without finishing the reply
+    PartialStall(String, String, u64),
 }
 
 pub struct FakeLlm {
@@ -57,6 +59,15 @@ fn respond(mut sock: TcpStream, script: Script) {
         }
         Script::Status(code, b) => {
             let _ = write!(sock, "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}", b.len());
+            return;
+        }
+        Script::PartialStall(r, t, secs) => {
+            let _ = sock.write_all(head.as_bytes());
+            for c in [role, json!({"choices":[{"delta":{"reasoning_content":r}}]}), json!({"choices":[{"delta":{"content":t}}]})] {
+                let _ = sock.write_all(format!("data: {c}\n\n").as_bytes());
+            }
+            let _ = sock.flush();
+            std::thread::sleep(Duration::from_secs(secs));
             return;
         }
         Script::Stall(secs) => {

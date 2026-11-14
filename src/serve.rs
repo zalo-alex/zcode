@@ -64,6 +64,16 @@ struct Params {
     sandbox_of: Option<String>,
 }
 
+/// A tool call of the step in flight.
+struct LiveTool {
+    id: String,
+    tool: String,
+    summary: String,
+    input: Value,
+    /// `(output, ok)` once its `tool_use` arrived
+    done: Option<(String, bool)>,
+}
+
 /// What the lead's turn is doing right now, kept up to date from the events it emits (for `status` and `attach` catch-up).
 #[derive(Default)]
 struct Live {
@@ -71,8 +81,53 @@ struct Live {
     since: Option<u64>,
     /// `step_start` events seen this turn
     step: u32,
-    /// tool calls of the current step that were started and have no `tool_use` yet: (callID, tool, summary)
-    running: Vec<(String, String, String)>,
+    /// assistant text and reasoning of the current step so far (from the deltas, or the whole `text`/`reasoning` event)
+    text: String,
+    reasoning: String,
+    /// seq of the current step's `step_start` (0 before the first)
+    step_seq: u64,
+    /// tool calls of the current step, in the order they started
+    tools: Vec<LiveTool>,
+}
+
+/// Most a live buffer keeps (a step's text/reasoning); more is dropped from the snapshot, never from the ring.
+const LIVE_CAP: usize = 1 << 20;
+/// Longest tool output kept in a snapshot, in chars (same as `history`).
+const LIVE_OUT_CAP: usize = 12000;
+
+impl Live {
+    fn feed(&mut self, v: &Value, seq: u64) {
+        let s = |x: &Value| x.as_str().unwrap_or("").to_string();
+        match v["type"].as_str() {
+            Some("step_start") => { self.step += 1; self.step_seq = seq; self.text.clear(); self.reasoning.clear(); self.tools.clear(); }
+            Some("text_delta") => { if self.text.len() < LIVE_CAP { self.text.push_str(v["delta"].as_str().unwrap_or("")); } }
+            Some("reasoning_delta") => { if self.reasoning.len() < LIVE_CAP { self.reasoning.push_str(v["delta"].as_str().unwrap_or("")); } }
+            // an instance that does not stream gets the whole text at once
+            Some("text") => self.text = s(&v["part"]["text"]),
+            Some("reasoning") => self.reasoning = s(&v["part"]["text"]),
+            Some("tool_start") => self.tools.push(LiveTool { id: s(&v["callID"]), tool: s(&v["tool"]), summary: s(&v["summary"]), input: v["input"].clone(), done: None }),
+            Some("tool_use") => {
+                let id = v["part"]["callID"].as_str().unwrap_or("");
+                if let Some(t) = self.tools.iter_mut().find(|t| t.id == id) {
+                    let out = v["part"]["state"]["output"].as_str().unwrap_or("");
+                    let out: String = if out.len() > LIVE_OUT_CAP { out.chars().take(LIVE_OUT_CAP).collect() } else { out.to_string() };
+                    t.done = Some((out, v["part"]["state"]["status"] != "error"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `partial` event for a client that attaches in the middle of a step.
+    fn partial(&self, name: &str, seq: u64) -> Value {
+        let tools: Vec<Value> = self.tools.iter().map(|t| {
+            let mut o = json!({"callID": t.id, "tool": t.tool, "summary": t.summary, "input": t.input, "done": t.done.is_some()});
+            if let Some((out, ok)) = &t.done { o["output"] = json!(out); o["ok"] = json!(ok); }
+            o
+        }).collect();
+        json!({"type": "partial", "instance": name, "agent": name, "timestamp": events::now_ms(), "seq": seq, "step": self.step,
+            "text": self.text, "reasoning": self.reasoning, "tools": tools})
+    }
 }
 
 #[derive(Default)]
@@ -121,15 +176,8 @@ impl Instance {
         v["seq"] = json!(b.seq);
         b.last_ts = v["timestamp"].as_u64().unwrap_or(0);
         if b.live.since.is_some() && v["agent"] == self.name.as_str() {
-            match v["type"].as_str() {
-                Some("step_start") => { b.live.step += 1; b.live.running.clear(); }
-                Some("tool_start") => {
-                    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
-                    b.live.running.push((s("callID"), s("tool"), s("summary")));
-                }
-                Some("tool_use") => { let id = v["part"]["callID"].as_str().unwrap_or(""); b.live.running.retain(|r| r.0 != id); }
-                _ => {}
-            }
+            let seq = b.seq;
+            b.live.feed(&v, seq);
         }
         if b.ring.len() >= self.ring_cap { b.ring.pop_front(); }
         b.ring.push_back(v.clone());
@@ -507,15 +555,31 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
         "attach" => {
             let inst = d.find(app, str_of(req, "instance")?)?;
             let since = req["since"].as_u64().unwrap_or(0);
+            let catch_up = req["catch_up"].as_bool() == Some(true);
             if let Some(h) = attached.remove(&inst.name) { h.abort(); }
             // subscribe first, then replay the ring: nothing is lost, duplicates are filtered by seq
             let mut sub = inst.tx.subscribe();
-            let backlog: Vec<Value> = inst.buf.lock().unwrap().ring.iter().filter(|e| e["seq"].as_u64().unwrap_or(0) > since).cloned().collect();
-            let n = backlog.len();
+            // one lock: the replay and the snapshot of the step in flight describe the same instant
+            let (backlog, partial, snap_seq) = {
+                let b = inst.buf.lock().unwrap();
+                let partial = (catch_up && b.live.since.is_some()).then(|| b.live.partial(&inst.name, b.seq));
+                let step_seq = b.live.step_seq;
+                let name = inst.name.as_str();
+                // the snapshot replaces the in-flight step's own events: replaying them as well would show that output twice
+                let in_step = |e: &Value| partial.is_some() && e["agent"] == name && e["seq"].as_u64().unwrap_or(0) > step_seq
+                    && matches!(e["type"].as_str(), Some("text_delta" | "reasoning_delta" | "text" | "reasoning" | "tool_start" | "tool_use"));
+                let backlog: Vec<Value> = b.ring.iter().filter(|e| e["seq"].as_u64().unwrap_or(0) > since && !in_step(e)).cloned().collect();
+                (backlog, partial, b.seq)
+            };
+            let (n, has_partial) = (backlog.len(), partial.is_some());
             let txc = tx.clone();
             let h = tokio::spawn(async move {
                 let mut last = since;
                 for e in backlog { last = e["seq"].as_u64().unwrap_or(last); if txc.send(e).is_err() { return; } }
+                if let Some(p) = partial {
+                    last = last.max(snap_seq);
+                    if txc.send(p).is_err() { return; }
+                }
                 loop {
                     match sub.recv().await {
                         Ok(e) => { let s = e["seq"].as_u64().unwrap_or(0); if s > last { last = s; if txc.send(e).is_err() { return; } } }
@@ -525,7 +589,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
                 }
             });
             attached.insert(inst.name.clone(), h);
-            Ok(json!({"replayed": n}))
+            Ok(json!({"replayed": n, "partial": has_partial}))
         }
         "detach" => {
             let n = str_of(req, "instance")?;
@@ -627,7 +691,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
                 // one lock for a consistent view of the turn and the newest event
                 let (turn, last_ts) = {
                     let b = i.buf.lock().unwrap();
-                    let turn = b.live.since.map(|since| json!({"since": since, "step": b.live.step, "tool": b.live.running.last().map(|r| r.1.clone())}));
+                    let turn = b.live.since.map(|since| json!({"since": since, "step": b.live.step, "tool": b.live.tools.iter().rev().find(|t| t.done.is_none()).map(|t| t.tool.clone())}));
                     (turn, if b.seq == 0 { None } else { Some(b.last_ts) })
                 };
                 json!({"instance": i.name, "cwd": i.p.cwd, "group": i.p.group, "running": i.running.load(Ordering::SeqCst), "crashed": i.crashed.load(Ordering::SeqCst),
