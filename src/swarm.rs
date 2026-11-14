@@ -473,7 +473,11 @@ impl Swarm {
         }
         let first = match resume {
             None => Some(format!("[from {parent}] {prompt}")),
-            Some(true) => Some("[system] The daemon restarted: your sandbox was recreated (running processes ended; files in the project and your write paths are kept). Check the state of your task and continue it.".to_string()),
+            Some(true) => {
+                let msg = "[system] The daemon restarted: your sandbox was recreated (running processes ended; files in the project and your write paths are kept). Check the state of your task and continue it.";
+                self.ev("user", json!({"agent": name, "text": msg, "source": "restart"}));
+                Some(msg.to_string())
+            }
             Some(false) => None,
         };
         let sw = self.clone();

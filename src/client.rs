@@ -82,7 +82,8 @@ pub async fn try_run(r: Req<'_>) -> Option<i32> {
             // identical to the embedded `--format json` stream, minus the daemon-only fields
             let mut o = v.clone();
             if let Some(m) = o.as_object_mut() { m.remove("instance"); m.remove("seq"); }
-            if kind != "turn_end" { println!("{o}"); let _ = std::io::stdout().flush(); }
+            // events only the daemon protocol has are not part of the embedded stream
+            if kind != "turn_end" && !matches!(kind, "user" | "partial" | "tool_start") { println!("{o}"); let _ = std::io::stdout().flush(); }
         } else {
             match kind {
                 "text_delta" => { print!("{}", v["delta"].as_str().unwrap_or("")); let _ = std::io::stdout().flush(); wrote_text = true; }

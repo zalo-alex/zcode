@@ -93,6 +93,10 @@ Every event has `type`, `timestamp` (ms) and `sessionID`.
 * `error.type`: `limit` (exit 3), `interrupted` (130), `api` (HTTP/stream failure, 1), `config` (setup failure, `sessionID` may be empty, 1).
 * Token counts are the upstream's `usage`, or an estimate (bytes/4) when the upstream sends none.
 
+### Daemon-only events
+
+Over the daemon socket (`zcode serve`, see `DAEMON.md`) the same events carry `instance`, `agent` and `seq`, plus events the embedded stream does not have: `user`, `tool_start`, `partial`, `text_delta`, `reasoning_delta`, `incoming`, `turn_end`, `restored`, `closed`, `warning`. `zcode run --format json` drops `user`, `tool_start` and `partial` so its output stays identical to the embedded one.
+
 ## Sessions
 
 `$XDG_DATA_HOME/zcode/sessions/<id>.jsonl` (default `~/.local/share/zcode/sessions`). Line 1 is a header

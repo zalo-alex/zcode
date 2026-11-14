@@ -233,18 +233,24 @@ impl Daemon {
                 let Some(sw) = sw else { break };
                 if !sw.has_agent(&i.name) { break; }
                 sw.wait_queued(&i.name).await;
+                // `wait_queued` also returns when the agent was removed (instance closed, daemon stopping): no turn for that
+                if i.frozen.load(Ordering::SeqCst) || !sw.has_agent(&i.name) { break; }
                 if i.running.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
-                if d.start_turn(&i, "[system] Messages arrived; read them above, act on them, and reply.".into()).is_err() { tokio::time::sleep(Duration::from_millis(50)).await; }
+                if d.start_turn(&i, "[system] Messages arrived; read them above, act on them, and reply.".into(), None).is_err() { tokio::time::sleep(Duration::from_millis(50)).await; }
             }
         }));
         Ok(())
     }
 
-    fn start_turn(self: &Arc<Self>, inst: &Arc<Instance>, input: String) -> Result<(), String> {
+    /// `source` = what to show clients as the author of `input`: `client` (a `prompt`), `restart` (the notice after a daemon restart);
+    /// `None` for turns woken by agent messages (those already produce `incoming` events).
+    fn start_turn(self: &Arc<Self>, inst: &Arc<Instance>, input: String, source: Option<&str>) -> Result<(), String> {
         if inst.crashed.load(Ordering::SeqCst) { return Err("instance crashed earlier; close it and create a new one".into()); }
         if inst.running.swap(true, Ordering::SeqCst) { return Err("instance is busy".into()); }
         inst.dirty.notify_one();
         let Some(mut agent) = inst.agent.lock().unwrap().take() else { inst.running.store(false, Ordering::SeqCst); return Err("instance is not ready".into()) };
+        // in the ring before the turn's first step_start, so replays and late attachers see what was asked
+        if let Some(src) = source { inst.push_event(json!({"type": "user", "timestamp": events::now_ms(), "agent": inst.name, "text": input, "source": src})); }
         agent.thinking = inst.thinking.load(Ordering::SeqCst);
         let cap = self.cfg.max_history_bytes;
         let sink = inst.sink();
@@ -407,7 +413,7 @@ impl Daemon {
             // every group member is back on the bus before anyone is woken
             for inst in wake {
                 let msg = "[system] The daemon restarted while you were working: your sandbox was recreated (running processes ended; files in the project are kept). Check the state of your task and continue it.";
-                if let Err(e) = d.start_turn(&inst, msg.into()) { inst.push_event(json!({"type": "warning", "message": format!("cannot resume the interrupted turn: {e}")})); }
+                if let Err(e) = d.start_turn(&inst, msg.into(), Some("restart")) { inst.push_event(json!({"type": "warning", "message": format!("cannot resume the interrupted turn: {e}")})); }
             }
         });
         n
@@ -504,7 +510,7 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             // a person typed: re-arm the agent-to-agent message caps and the reply-chain counter
             if let Some(sw) = inst.swarm.lock().unwrap().clone() { sw.reset_caps(); }
             if let Some(a) = inst.agent.lock().unwrap().as_mut() { a.last_hops = 0; }
-            d.start_turn(&inst, text)?;
+            d.start_turn(&inst, text, Some("client"))?;
             Ok(json!({}))
         }
         "build" => {
