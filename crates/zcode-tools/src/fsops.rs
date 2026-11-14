@@ -24,9 +24,14 @@ pub struct LocalFs {
     stamps: Mutex<HashMap<PathBuf, u64>>,
 }
 
+/// Content stamp for stale-edit detection (in memory only, never persisted): 8 bytes per step.
 pub fn hash(b: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for x in b { h ^= *x as u64; h = h.wrapping_mul(0x100000001b3); }
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mix = |h: u64, w: u64| { let h = (h ^ w).wrapping_mul(K); h ^ (h >> 29) };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ b.len() as u64;
+    let (words, r) = b.as_chunks::<8>();
+    for c in words { h = mix(h, u64::from_le_bytes(*c)); }
+    if !r.is_empty() { let mut w = [0u8; 8]; w[..r.len()].copy_from_slice(r); h = mix(h, u64::from_le_bytes(w)); }
     h
 }
 

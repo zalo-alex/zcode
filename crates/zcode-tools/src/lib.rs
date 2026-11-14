@@ -384,4 +384,28 @@ mod tests {
         std::fs::write(d.join("x.bin"), [0u8, 1, 2, 3]).unwrap();
         assert!(run("read", &json!({"path":"x.bin"}), &ctx).await.unwrap_err().to_string().contains("binary file"));
     }
+
+    #[test]
+    fn content_stamp_notices_every_single_byte_change() {
+        use crate::fsops::hash;
+        let base: Vec<u8> = (0..70u8).map(|i| i.wrapping_mul(31)).collect();
+        let h = hash(&base);
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 70] { assert_eq!(hash(&base[..n]), hash(&base[..n])); }
+        for i in 0..base.len() { let mut b = base.clone(); b[i] ^= 1; assert_ne!(hash(&b), h, "byte {i}"); }
+        assert_ne!(hash(b""), hash(b"\0"));
+        assert_ne!(hash(&base[..69]), h);
+    }
+
+    #[tokio::test]
+    async fn finished_background_jobs_and_kills_do_not_wait_out_the_timers() {
+        let ctx = Ctx::new(tmp("bgfast"));
+        let t = std::time::Instant::now();
+        let o = run("bash", &json!({"command":"echo quick","background":true}), &ctx).await.unwrap();
+        assert!(o.contains("quick") && t.elapsed() < Duration::from_millis(500), "{o} {:?}", t.elapsed());
+        let o = run("bash", &json!({"command":"sleep 30","background":true}), &ctx).await.unwrap();
+        let id = o.split_whitespace().nth(3).unwrap().to_string();
+        let t = std::time::Instant::now();
+        let k = run("bash_kill", &json!({"id": id}), &ctx).await.unwrap();
+        assert!(k.contains("killed") && t.elapsed() < Duration::from_millis(1000), "{:?}", t.elapsed());
+    }
 }

@@ -210,7 +210,12 @@ impl LocalSandbox {
         let pid = child.id().ok_or_else(|| anyhow!("failed to start"))?;
         let id = format!("job{n}");
         self.jobs.lock().unwrap().insert(id.clone(), Job { pid, log: log.clone(), exit, cmd: cmd.to_string() });
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        // give it up to 700 ms to print something, but do not wait that long for a job that already finished
+        let exit_f = self.jobs.lock().unwrap().get(&id).map(|j| j.exit.clone());
+        for _ in 0..35 {
+            if exit_f.as_ref().is_some_and(|e| e.exists()) { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let t = format!("started background job {id} (pid {pid}), log {}\n--- output so far ---\n{}", log.display(), tail_lines(&log, 30));
         Ok(ExecStream::ready(t.into_bytes(), ExecDone { code: None, timed_out: false }))
     }
@@ -237,7 +242,11 @@ impl LocalSandbox {
     async fn job_kill(&self, id: &str) -> Result<String> {
         let pid = self.jobs.lock().unwrap().get(id).map(|j| j.pid).ok_or_else(|| anyhow!("no such job `{id}`"))?;
         kill_group(pid, 15);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // up to 300 ms to exit on SIGTERM; stop waiting as soon as the group is gone
+        for _ in 0..15 {
+            if unsafe { kill(-(pid as i32), 0) } != 0 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         kill_group(pid, 9);
         Ok(format!("{id} killed"))
     }
