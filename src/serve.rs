@@ -334,6 +334,7 @@ impl Daemon {
         let sid = agent.sid().to_string();
         let swarm = inst.swarm.lock().unwrap().clone();
         let name = inst.name.clone();
+        let inst_w = inst.clone();
         if let Some(sw) = &swarm { sw.set_status(&name, crate::swarm::Status::Running); }
         let work = events::SINK.scope(sink, async move {
             #[cfg(debug_assertions)]
@@ -347,23 +348,25 @@ impl Daemon {
                 Err(e) => ("error", 1, e.to_string(), String::new()),
             };
             if stop == "error" { events::error(&sid, "api", &msg); }
+            // the instance must be free again before `turn_end` is visible: a client that sends the next `prompt` the moment it
+            // sees `turn_end` would otherwise get "instance is busy"
+            *inst_w.agent.lock().unwrap() = Some(agent);
+            inst_w.buf.lock().unwrap().live = Live::default();
+            inst_w.running.store(false, Ordering::SeqCst);
+            inst_w.dirty.notify_one();
             events::custom(&sid, "turn_end", json!({"stop": stop, "code": code, "message": msg, "text": text}));
-            agent
         });
         let (h, inst2) = (tokio::spawn(work), inst.clone());
         tokio::spawn(async move {
-            match h.await {
-                Ok(agent) => { *inst2.agent.lock().unwrap() = Some(agent); }
-                Err(e) => {
-                    // a panic stays inside this instance
-                    inst2.crashed.store(true, Ordering::SeqCst);
-                    inst2.push_event(json!({"type": "error", "agent": inst2.name, "error": {"type": "panic", "message": format!("instance panicked: {e}")}}));
-                    inst2.push_event(json!({"type": "turn_end", "agent": inst2.name, "stop": "error", "code": 1, "message": "instance panicked", "text": ""}));
-                }
+            // normal completion already released the instance; only a panic gets here with work to do
+            if let Err(e) = h.await {
+                inst2.crashed.store(true, Ordering::SeqCst);
+                inst2.push_event(json!({"type": "error", "agent": inst2.name, "error": {"type": "panic", "message": format!("instance panicked: {e}")}}));
+                inst2.push_event(json!({"type": "turn_end", "agent": inst2.name, "stop": "error", "code": 1, "message": "instance panicked", "text": ""}));
+                inst2.buf.lock().unwrap().live = Live::default();
+                inst2.running.store(false, Ordering::SeqCst);
+                inst2.dirty.notify_one();
             }
-            inst2.buf.lock().unwrap().live = Live::default();
-            inst2.running.store(false, Ordering::SeqCst);
-            inst2.dirty.notify_one();
         });
         Ok(())
     }
