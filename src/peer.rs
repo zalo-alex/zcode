@@ -32,7 +32,10 @@ pub struct Join<'a> {
     pub session: Option<String>,
 }
 
-const HELP: &str = "/help  /agents  /cost  /status  /thinking [on|off]  /exit   (Ctrl-C interrupts your agent; anything else you type is sent to it)";
+const HELP: &str = "/help  /agents  /cost  /status  /todo  /clear  /compact  /image <path>  /thinking [on|off]  /exit   (Ctrl-C interrupts your agent; anything else you type is sent to it)";
+
+/// A line to send: its text and the images (base64) attached to it.
+type Line = (String, Vec<String>);
 
 enum Input { Line(String), Interrupt, Eof }
 
@@ -161,7 +164,7 @@ async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Ve
     let (fr_tx, mut fr_rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(read_loop(rd, fr_tx));
 
-    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false, rbuf: String::new(), thinking, thinking_req: None, seq: 0 };
+    let mut p = Peer { name: name.clone(), group: group.clone(), wr, n, busy: false, pending: VecDeque::new(), prompts: HashMap::new(), agents_req: None, buf: String::new(), tin: 0, tout: 0, eof: false, streamed: false, rbuf: String::new(), thinking, thinking_req: None, seq: 0, cmd_reqs: HashMap::new(), images: vec![], cwd: std::env::current_dir().unwrap_or_default() };
     let mut code = 0;
     loop {
         tokio::select! {
@@ -184,7 +187,7 @@ async fn interact(s: UnixStream, n: u64, name: String, group: String, banner: Ve
                             tokio::spawn(read_loop(rd, tx));
                             (p.wr, fr_rx) = (wr, rx);
                             // prompts the old connection never answered go out again; the restored agent may also be resuming by itself
-                            let mut lost: Vec<String> = p.prompts.drain().map(|(_, v)| v).collect();
+                            let mut lost: Vec<Line> = p.prompts.drain().map(|(_, v)| v).collect();
                             lost.reverse();
                             for l in lost { p.pending.push_front(l); }
                             p.busy = false;
@@ -234,9 +237,9 @@ struct Peer {
     wr: OwnedWriteHalf,
     n: u64,
     busy: bool,
-    pending: VecDeque<String>,
+    pending: VecDeque<Line>,
     /// request id of an in-flight `prompt` -> its text, to requeue it when the agent turned out to be busy
-    prompts: HashMap<u64, String>,
+    prompts: HashMap<u64, Line>,
     agents_req: Option<u64>,
     /// the model's text so far, up to its last newline
     buf: String,
@@ -249,6 +252,11 @@ struct Peer {
     rbuf: String,
     thinking: Option<bool>,
     thinking_req: Option<u64>,
+    /// `/clear`, `/compact`, `/todo` in flight: request id -> command
+    cmd_reqs: HashMap<u64, &'static str>,
+    /// images from `/image`, sent with the next line
+    images: Vec<String>,
+    cwd: std::path::PathBuf,
 }
 
 impl Peer {
@@ -260,9 +268,10 @@ impl Peer {
         self.n
     }
 
-    async fn prompt(&mut self, text: String) {
-        let id = self.send("prompt", json!({"text": text})).await;
-        self.prompts.insert(id, text);
+    async fn prompt(&mut self, line: Line) {
+        let fields = if line.1.is_empty() { json!({"text": line.0}) } else { json!({"text": line.0, "images": line.1.iter().map(|b| json!({"data": b})).collect::<Vec<_>>()}) };
+        let id = self.send("prompt", fields).await;
+        self.prompts.insert(id, line);
         self.busy = true;
     }
 
@@ -285,6 +294,24 @@ impl Peer {
                 "agents" => { let id = self.send("status", json!({})).await; self.agents_req = Some(id); }
                 "cost" => out.line(&format!("tokens in {} / out {}", self.tin, self.tout)),
                 "status" => out.line(&format!("group {} · agent {} · {} · thinking {}", self.group, self.name, if self.busy { "working" } else { "idle" }, match self.thinking { Some(true) => "on", Some(false) => "off", None => "?" })),
+                c @ ("clear" | "compact" | "todo") => {
+                    let c: &'static str = match c { "clear" => "clear", "compact" => "compact", _ => "todo" };
+                    if self.busy && c != "todo" { out.line("your agent is busy; try again when it is done"); return false; }
+                    let id = self.send(c, json!({})).await;
+                    self.cmd_reqs.insert(id, c);
+                }
+                "image" => {
+                    let arg = cmd["image".len()..].trim().trim_matches(|c| c == '"' || c == '\'');
+                    if arg.is_empty() { out.line("usage: /image <path>   (attaches to your next message)"); return false; }
+                    let p = std::path::Path::new(arg);
+                    let p = if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) };
+                    match std::fs::read(&p) {
+                        Err(e) => out.line(&format!("error: {}: {e}", p.display())),
+                        Ok(b) if b.len() > zcode_tools::img::MAX_SRC => out.line(&format!("error: {}: {}", p.display(), zcode_tools::img::too_big_note(b.len()))),
+                        Ok(b) if zcode_tools::img::sniff(&b).is_none() => out.line(&format!("error: {}: not a supported image (jpeg, png, gif, webp)", p.display())),
+                        Ok(b) => { self.images.push(zcode_tools::img::b64_encode(&b)); out.line(&format!("attached {}", p.display()).dimmed()); }
+                    }
+                }
                 "thinking" => {
                     let arg = cmd.split_whitespace().nth(1).unwrap_or("");
                     let on = match arg { "on" => Some(true), "off" => Some(false), "" => None, _ => { out.line("usage: /thinking [on|off]"); return false; } };
@@ -296,10 +323,11 @@ impl Peer {
             return false;
         }
         if self.busy {
-            self.pending.push_back(l.to_string());
+            self.pending.push_back((l.to_string(), std::mem::take(&mut self.images)));
             out.line(&"(your agent is busy; sent when it is done)".dimmed());
         } else {
-            self.prompt(l.to_string()).await;
+            let images = std::mem::take(&mut self.images);
+            self.prompt((l.to_string(), images)).await;
         }
         false
     }
@@ -308,10 +336,10 @@ impl Peer {
     async fn frame(&mut self, out: &mut Out, v: Value) {
         if let Some(s) = v["seq"].as_u64() { self.seq = self.seq.max(s); }
         if let Some(id) = v["req"].as_u64() {
-            if let Some(text) = self.prompts.remove(&id) {
+            if let Some(line) = self.prompts.remove(&id) {
                 if v["ok"] != true {
                     let e = v["err"].as_str().unwrap_or("");
-                    if e.contains("busy") { self.pending.push_front(text); self.busy = true; }  // a peer's message woke it first: our turn_end will resend
+                    if e.contains("busy") { self.pending.push_front(line); self.busy = true; }  // a peer's message woke it first: our turn_end will resend
                     else { out.line(&format!("{} {e}", "error:".red())); self.busy = false; }
                 }
             } else if self.thinking_req == Some(id) {
@@ -321,6 +349,17 @@ impl Peer {
                     self.thinking = Some(on);
                     out.line(&format!("thinking {} (from your agent's next turn)", if on { "on" } else { "off" }));
                 } else { out.line(&format!("{} {}", "error:".red(), v["err"].as_str().unwrap_or(""))); }
+            } else if let Some(cmd) = self.cmd_reqs.remove(&id) {
+                if v["ok"] != true { out.line(&format!("{} {}", "error:".red(), v["err"].as_str().unwrap_or(""))); }
+                else { match cmd {
+                    "clear" => out.line("cleared"),
+                    "compact" => out.line(&format!("compacted → ~{} tokens", v["tokens"])),
+                    _ => {
+                        let todos = v["todos"].as_array().cloned().unwrap_or_default();
+                        if todos.is_empty() { out.line("(no todos)"); }
+                        for t in &todos { out.line(&format!("[{}] {}", match t["status"].as_str().unwrap_or("") { "completed" => "x", "in_progress" => "~", _ => " " }, t["content"].as_str().unwrap_or(""))); }
+                    }
+                } }
             } else if self.agents_req == Some(id) {
                 self.agents_req = None;
                 if let Some(l) = v["instances"][0]["agents"].as_array() { for a in l.iter().filter_map(|x| x.as_str()) { out.line(a); } }

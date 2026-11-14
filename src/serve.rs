@@ -681,6 +681,30 @@ async fn dispatch(d: &Arc<Daemon>, app: &str, op: &str, req: &Value, tx: &mpsc::
             let first = end.saturating_sub(limit);
             Ok(json!({"items": &all[first..end], "first": first, "total": total}))
         }
+        "clear" | "compact" => {
+            // the REPL commands, for an idle instance: `clear` empties the conversation, `compact` summarizes it
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            d.ensure_built(&inst).await?;
+            if inst.crashed.load(Ordering::SeqCst) { return Err("instance crashed earlier; close it and create a new one".into()); }
+            if inst.running.swap(true, Ordering::SeqCst) { return Err("instance is busy".into()); }
+            let taken = inst.agent.lock().unwrap().take();
+            let Some(mut agent) = taken else { inst.running.store(false, Ordering::SeqCst); return Err("instance is not ready".into()) };
+            let r = if op == "clear" { agent.reset(); Ok(()) } else { agent.shrink(true).await };
+            let tokens = context::estimate(&agent.msgs);
+            *inst.agent.lock().unwrap() = Some(agent);
+            inst.running.store(false, Ordering::SeqCst);
+            inst.dirty.notify_one();
+            r.map(|_| json!({"tokens": tokens})).map_err(|e| e.to_string())
+        }
+        "todo" => {
+            let inst = d.find(app, str_of(req, "instance")?)?;
+            d.ensure_built(&inst).await?;
+            let todos = match inst.agent.lock().unwrap().as_ref() {
+                Some(a) => a.ctx.todos.lock().unwrap().iter().map(|(s, c)| json!({"status": s, "content": c})).collect::<Vec<_>>(),
+                None => return Err("instance is busy".into()),
+            };
+            Ok(json!({"todos": todos}))
+        }
         "thinking" => {
             // show / hide the model's reasoning for this instance (takes effect from its next turn); no `on` = just report
             let inst = d.find(app, str_of(req, "instance")?)?;

@@ -335,3 +335,33 @@ fn partial_lists_the_tools_of_the_step_and_does_not_replay_the_steps_own_events(
     assert_eq!(end["part"]["callID"], "call_0_bash");
     b.wait("turn end", turn_end("m"));
 }
+
+#[test]
+fn clear_compact_and_todo_refuse_a_busy_instance_and_report_a_free_one() {
+    let e = Env::new("ev_cmds");
+    let llm = FakeLlm::start_fn(|r| {
+        if r["messages"][0]["content"].as_str().unwrap_or("").starts_with("Summarize") { return text("SUM"); }
+        let long = r["messages"].as_array().unwrap().iter().any(|m| m["content"].as_str().is_some_and(|c| c.contains("long job")));
+        if long && n_assist(r) == 0 { Script::Stall(2) } else { text("ok") }
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut c = Client::connect(&d);
+    create(&mut c, "k", &e.cwd, &llm, json!({}));
+    c.ok("attach", json!({"instance": "k"}));
+    assert_eq!(c.ok("todo", json!({"instance": "k"}))["todos"], json!([]));
+    c.ok("prompt", json!({"instance": "k", "text": "long job"}));
+    c.wait("step", |x| x["type"] == "step_start");
+    for op in ["clear", "compact", "todo"] {
+        let r = c.call(op, json!({"instance": "k"}));
+        assert_eq!(r["ok"], false, "{op}: {r}");
+        assert!(r["err"].as_str().unwrap().contains("busy"), "{op}: {r}");
+    }
+    c.ok("cancel", json!({"instance": "k"}));
+    c.wait("turn end", turn_end("k"));
+    let r = c.ok("clear", json!({"instance": "k"}));
+    assert!(r["tokens"].as_u64().unwrap() < 1000, "{r}");
+    assert_eq!(c.ok("history", json!({"instance": "k"}))["total"], 0);
+    // the instance is free again right away
+    c.ok("prompt", json!({"instance": "k", "text": "after clear"}));
+    c.wait("turn end", turn_end("k"));
+}

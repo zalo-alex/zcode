@@ -166,3 +166,48 @@ fn joining_needs_a_daemon_auto_and_a_free_name() {
     assert!(second.screen().contains("already exists") && second.screen().contains("--agent"), "{}", second.screen());
     first.say("/exit");
 }
+
+#[test]
+fn group_mode_has_todo_clear_compact_and_image() {
+    let e = Env::new("p_cmds");
+    std::fs::write(e.cwd.join("a.png"), zcode_tools::img::b64_decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==").unwrap()).unwrap();
+    let llm = FakeLlm::start_fn(|r| {
+        let (all, n) = (all_text(r), n_assist(r));
+        // the summarizer request (compact) has no tools and asks for a summary
+        if r["messages"][0]["content"].as_str().unwrap_or("").starts_with("Summarize this coding-agent conversation") { return text("SUMMARY-OF-EARLIER-TALK"); }
+        if all.contains("make a list") && n == 0 { return tool("todowrite", json!({"todos":[{"content":"write the tests","status":"in_progress"},{"content":"ship it","status":"pending"}]})); }
+        text("done")
+    });
+    let d = start(&e, json!({}), &[]);
+    let mut t = join(&e, &llm, "solo", "me", &[]);
+    t.wait_for("joined group `solo` as `me`");
+    t.say("/todo");
+    t.wait_for("(no todos)");
+    t.say("make a list");
+    t.wait_for("done");
+    t.say("/todo");
+    t.wait_for("[~] write the tests");
+    assert!(t.screen().contains("[ ] ship it"), "{}", t.screen());
+    // /image goes with the next line only; this model has no vision, so it gets the note
+    t.say("/image nope.png");
+    t.wait_for("nope.png");
+    t.say("/image a.png");
+    t.wait_for("attached");
+    t.say("look at this");
+    let t0 = Instant::now();
+    while !llm.requests.lock().unwrap().iter().any(|r| all_text(r).contains("this model cannot see it")) {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the image never arrived; screen:\n{}", t.screen());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // enough turns to have something to summarize
+    for i in 0..3 { t.say(&format!("more talk {i}")); std::thread::sleep(Duration::from_millis(300)); }
+    t.say("/compact");
+    t.wait_for("compacted → ~");
+    let mut c = Client::connect(&d);
+    let h = c.ok("history", json!({"instance": "me"}));
+    assert!(h["items"][0]["text"].as_str().unwrap().contains("SUMMARY-OF-EARLIER-TALK"), "{h}");
+    t.say("/clear");
+    t.wait_for("cleared");
+    let h = c.ok("history", json!({"instance": "me"}));
+    assert_eq!(h["total"], 0, "{h}");
+}
