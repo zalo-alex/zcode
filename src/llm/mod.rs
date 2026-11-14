@@ -169,7 +169,7 @@ pub fn flatten_images(msgs: &[Message]) -> Vec<Message> {
 /// One process-wide client (shared by the main and small model): one TLS config, shared connection pool.
 fn http_client() -> reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap()).clone()
+    C.get_or_init(|| { zcode_tools::init_tls(); reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap() }).clone()
 }
 
 /// Request body; fields in alphabetical order so the bytes equal what a `json!` map (sorted keys) produced.

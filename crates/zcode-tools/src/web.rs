@@ -7,6 +7,7 @@ use serde_json::Value;
 fn client() -> Result<&'static reqwest::Client> {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(c) = C.get() { return Ok(c); }
+    crate::init_tls();
     let c = reqwest::Client::builder().user_agent("zcode/0.1").build()?;
     Ok(C.get_or_init(|| c))
 }

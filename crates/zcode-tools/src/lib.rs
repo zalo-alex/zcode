@@ -20,6 +20,12 @@ mod pathguard {
         pub fn canon_of(&self, _: &File) -> Option<PathBuf> { None }
     }
 }
+/// Install the `ring` crypto provider for rustls (once). Call before building the first `reqwest::Client`.
+#[cfg(any(feature = "web", feature = "oci"))]
+pub fn init_tls() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+}
 pub mod frames;
 pub mod img;
 pub mod sandbox;
@@ -407,5 +413,16 @@ mod tests {
         let t = std::time::Instant::now();
         let k = run("bash_kill", &json!({"id": id}), &ctx).await.unwrap();
         assert!(k.contains("killed") && t.elapsed() < Duration::from_millis(1000), "{:?}", t.elapsed());
+    }
+
+    /// Needs the internet: `cargo test -p zcode-tools -- --ignored https_works`. Proves the TLS provider is installed and the platform verifier works.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    #[ignore]
+    async fn https_works() {
+        let mut ctx = Ctx::new(tmp("https"));
+        ctx.net = true;
+        let o = run("webfetch", &json!({"url":"https://example.com"}), &ctx).await.unwrap();
+        assert!(o.contains("Example Domain"), "{o}");
     }
 }

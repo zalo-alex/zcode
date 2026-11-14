@@ -7,9 +7,9 @@ license = "MIT"
 
 [features]
 default = ["web", "tier1", "host"]
-web = ["dep:reqwest"]
+web = ["dep:reqwest", "dep:rustls"]
 # in-process `zcode image pull` / `image gc` (registry v2 client)
-oci = ["dep:reqwest", "dep:sha2", "dep:flate2"]
+oci = ["dep:reqwest", "dep:rustls", "dep:sha2", "dep:flate2"]
 tier1 = ["dep:seccompiler"]
 # host-side container backend (supervisor, OCI config, images); the guest does not need it
 host = []
@@ -20,7 +20,8 @@ globset = "0.4.21"
 ignore = "0.4.34"
 libc = "0.2"
 regex = "1.13.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json"], optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream", "json"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 serde_json = "1.0.154"
 similar = "3.2.1"
 sha2 = { version = "0.10", optional = true }

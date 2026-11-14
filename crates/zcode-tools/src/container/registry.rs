@@ -120,6 +120,7 @@ fn parse_challenge(h: &str) -> Option<Vec<(String, String)>> {
 
 impl Reg {
     fn new(r: &Ref) -> Result<Reg, String> {
+        crate::init_tls();
         let http = reqwest::Client::builder().user_agent(concat!("zcode/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(20)).read_timeout(Duration::from_secs(60)).build().map_err(|e| e.to_string())?;
         let scheme = if loopback(&r.endpoint) { "http" } else { "https" };
