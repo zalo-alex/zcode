@@ -32,6 +32,8 @@ struct ServeCfg {
     max_instances: usize,
     max_history_bytes: usize,
     ring: usize,
+    /// injection guard of the instances (`serve.guard`, default off); a `create` request can override it
+    guard: GuardMode,
     /// app -> token; empty = no authentication beyond SO_PEERCRED
     apps: HashMap<String, String>,
 }
@@ -62,6 +64,7 @@ struct Params {
     container: Value,
     /// run in another instance's sandbox (same container, same shell state) instead of opening one
     sandbox_of: Option<String>,
+    guard: GuardMode,
 }
 
 /// A tool call of the step in flight.
@@ -255,7 +258,7 @@ impl Daemon {
         let net = policy.net || p.mode == Mode::None;
         let ctx = Arc::new(tools::Ctx::with_sandbox(sandbox.clone(), net));
         let mut agent = Agent::new(client.clone(), ctx, AgentOpts {
-            yes: true, allow_outside: policy.outside, guard: GuardMode::Deny, readonly: false, quiet: false, format: events::Format::Json,
+            yes: true, allow_outside: policy.outside, guard: p.guard, readonly: false, quiet: false, format: events::Format::Json,
             limits: p.limits.clone(), small: small.clone(), thinking: inst.thinking.load(Ordering::SeqCst),
         });
         agent.name = inst.name.clone();
@@ -425,13 +428,17 @@ impl Daemon {
         let (btx, _) = broadcast::channel(1024);
         let group = req["group"].as_str().map(String::from);
         if group.as_ref().is_some_and(|g| !valid_name(g)) { return Err("invalid group name".into()); }
+        let guard = match req["guard"].as_str() {
+            Some(g) => GuardMode::parse(g).ok_or("`guard` must be off, warn, deny or ask")?,
+            None => self.cfg.guard,
+        };
         let mut stored = req.clone();
         stored["session"] = json!(session);
         let inst = Arc::new(Instance {
             name: name.to_string(), app: app.to_string(),
             p: Params { cwd, config: req["config"].clone(), model: req["model"].as_str().map(String::from), mode, require_sandbox: req["require_sandbox"].as_bool().unwrap_or(false),
                 policy: req["policy"].clone(), limits, group, max_workers: req["max_workers"].as_u64().unwrap_or(0) as usize, stream: req["stream"].as_bool().unwrap_or(false),
-                session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from) },
+                session: session.clone(), swarm: req["swarm"].clone(), container: req["container"].clone(), sandbox_of: req["sandbox_of"].as_str().map(String::from), guard },
             agent: Mutex::new(None), build: tokio::sync::Mutex::new(false), running: AtomicBool::new(false), crashed: AtomicBool::new(false),
             swarm: Mutex::new(None), sandbox: Mutex::new(None), cancel: Arc::new(Cancel::default()), thinking: AtomicBool::new(req["thinking"].as_bool().unwrap_or(false)),
             buf: Mutex::new(EventBuf { seq, ..EventBuf::default() }), tx: btx, ring_cap: self.cfg.ring,
@@ -758,10 +765,14 @@ pub async fn run() -> anyhow::Result<i32> {
     let raw = config::layers();
     let sc = raw.get("serve").cloned().unwrap_or(Value::Null);
     let g = |k: &str, d: u64| sc.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+    let guard = match sc.get("guard").and_then(|v| v.as_str()) {
+        None => GuardMode::Off,
+        Some(g) => GuardMode::parse(g).unwrap_or_else(|| { eprintln!("zcode serve: unknown serve.guard `{g}`, using off"); GuardMode::Off }),
+    };
     let apps: HashMap<String, String> = sc.get("apps").and_then(|v| v.as_object()).map(|o| o.iter().map(|(k, v)| (k.clone(), v["token"].as_str().unwrap_or("").to_string())).collect()).unwrap_or_default();
     let global = Budget::new(&Limits { max_time: None, max_steps: g("max_steps", u64::MAX / 2) as usize, max_tokens: g("max_tokens", u64::MAX / 2) });
     let d = Arc::new(Daemon {
-        cfg: ServeCfg { max_instances: g("max_instances", 64) as usize, max_history_bytes: g("max_history_bytes", 8 << 20) as usize, ring: g("event_ring", 2000) as usize, apps },
+        cfg: ServeCfg { max_instances: g("max_instances", 64) as usize, max_history_bytes: g("max_history_bytes", 8 << 20) as usize, ring: g("event_ring", 2000) as usize, guard, apps },
         instances: Default::default(), groups: Default::default(), clients: Default::default(),
         gate: Arc::new(Semaphore::new(g("concurrency", 8) as usize)), global: Arc::new(global),
     });

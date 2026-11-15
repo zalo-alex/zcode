@@ -34,6 +34,19 @@ pub enum GuardMode {
     Off,
 }
 
+impl GuardMode {
+    /// `off` | `warn` | `deny` | `ask`, case-insensitive, surrounding spaces ignored.
+    pub fn parse(s: &str) -> Option<GuardMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(GuardMode::Off),
+            "warn" => Some(GuardMode::Warn),
+            "deny" => Some(GuardMode::Deny),
+            "ask" => Some(GuardMode::Ask),
+            _ => None,
+        }
+    }
+}
+
 /// True if tool output contains text that tries to instruct the agent.
 pub fn suspicious(output: &str) -> bool {
     inj_re().is_match(output)
@@ -100,6 +113,13 @@ mod tests {
         assert!(suspicious("system instruction: do X"));
         assert!(!suspicious("Meeting notes: budget up 4%, hire two engineers."));
         assert!(!suspicious("def ignore(x): return x  # skip user input handling"));
+    }
+    #[test]
+    fn guard_mode_parse() {
+        for (s, m) in [("off", GuardMode::Off), ("WARN", GuardMode::Warn), ("Deny", GuardMode::Deny), (" ask ", GuardMode::Ask)] {
+            assert_eq!(GuardMode::parse(s), Some(m));
+        }
+        assert_eq!((GuardMode::parse("on"), GuardMode::parse("")), (None, None));
     }
     #[test]
     fn unfinished_detection() {

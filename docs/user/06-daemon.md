@@ -149,6 +149,7 @@ Under `"serve"` in the daemon's own config, all optional:
 | `max_instances` | 64 | how many agents it will host at once |
 | `max_history_bytes` | 8 MiB | conversation size per agent before it is compacted |
 | `concurrency` | 8 | model requests in flight at once, across everything |
+| `guard` | `off` | prompt-injection guard of the agents: `off` does nothing; `warn` prefixes suspicious tool results with a warning; `deny` also blocks writes and commands for the rest of the turn; `ask` is `deny` here (nobody can answer). Off by default because agents that read web pages all day trip the heuristic on ordinary text, and the daemon has no one to answer a prompt. A `create` request can set `guard` for one agent |
 | `max_steps`, `max_tokens` | unlimited | budgets for everything the daemon does |
 | `apps` | none | `{"myapp": {"token": "…"}}`: require every client to log in as an app, and keep each app's agents apart |
 

@@ -6,7 +6,7 @@ One resident process hosting many agent instances on the same in-memory bus. Ins
 zcode serve          # foreground; Ctrl-C / SIGTERM stops every instance and container, removes the socket and keeps the restart manifests
 ```
 
-Config (`serve` key of the daemon's own config): `max_instances` (64), `max_history_bytes` (8 MiB per instance; over that the context is compacted before a turn), `event_ring` (2000 events kept per instance), `concurrency` (8 model requests at once, daemon-wide), `max_steps` / `max_tokens` (daemon-wide budgets, unlimited by default), `apps` (`{"name": {"token": "..."}}`; when present every connection must `hello` with a valid app and token).
+Config (`serve` key of the daemon's own config): `max_instances` (64), `max_history_bytes` (8 MiB per instance; over that the context is compacted before a turn), `event_ring` (2000 events kept per instance), `concurrency` (8 model requests at once, daemon-wide), `guard` (`off` | `warn` | `deny` | `ask`, default `off`; `create` may override it per instance with a `guard` field), `max_steps` / `max_tokens` (daemon-wide budgets, unlimited by default), `apps` (`{"name": {"token": "..."}}`; when present every connection must `hello` with a valid app and token).
 
 ## What comes from where
 
