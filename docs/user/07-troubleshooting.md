@@ -9,6 +9,7 @@ Messages are quoted exactly as zcode prints them. Find yours, then read what to 
 | `` error: no model configured: set `model` in config, --model provider/model, or ZCODE_MODEL ``  | zcode does not know which model to use. Put `"model": "provider/model"` in `~/.config/zcode/config.json`, or pass `-m provider/model` ([chapter 1](01-install-and-first-run.md#connect-a-model)) |
 | `` error: provider for model `demo/m` not found (configured providers: none) ``  | the model names a provider that is not in your config. `ZCODE_BASE_URL` and `ZCODE_API_KEY` only adjust a provider that already exists in the config, they do not create one |
 | `error: LLM HTTP 401: {"error":{"message":"invalid api key"}}` | the server rejected your key. Check `apiKey` (or `ZCODE_API_KEY`) and the `baseURL` |
+| `error sending request for url (https://...): certificate not accepted: UnknownIssuer` (also `CaUsedAsEndEntity`, `NotValidForName`, `Expired`) | the server's TLS certificate was refused, and the last part says why. For a self-signed or private-CA endpoint, put its certificate in the file named by `SSL_CERT_FILE`; it needs a SAN for the host name you use in `baseURL` and must be within its dates ([chapter 1](01-install-and-first-run.md#connect-a-model)) |
 | `error: invalid value 'banana' for '--sandbox <SANDBOX>'` | a typo in a flag. The message lists the allowed values; exit code 2 |
 
 ## The sandbox says no

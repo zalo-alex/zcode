@@ -40,6 +40,8 @@ zcode talks to any OpenAI-compatible chat endpoint. Tell it where in `~/.config/
 $ ZCODE_CONFIG_CONTENT='{"model":"myprovider/my-model","provider":{"myprovider":{"options":{"baseURL":"http://localhost:8080/v1"}}}}' zcode run "hello"
 ```
 
+**An HTTPS endpoint with a self-signed certificate** works by pinning it: put the certificate (PEM) in the file named by `SSL_CERT_FILE` (usually the system bundle plus that certificate). zcode trusts a server whose certificate is exactly one of those, even if it is marked as a CA, but it still checks that the certificate is within its dates and that its SAN (`subjectAltName`) contains the host name from `baseURL`. Every other certificate is checked as usual.
+
 If nothing is configured, zcode says what is missing:
 
 ```text
