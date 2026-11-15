@@ -42,3 +42,6 @@ panic = "abort"
 [profile.serve]
 inherits = "release"
 panic = "unwind"
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

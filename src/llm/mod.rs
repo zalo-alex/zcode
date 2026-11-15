@@ -169,7 +169,7 @@ pub fn flatten_images(msgs: &[Message]) -> Vec<Message> {
 /// One process-wide client (shared by the main and small model): one TLS config, shared connection pool.
 fn http_client() -> reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| { zcode_tools::init_tls(); reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap() }).clone()
+    C.get_or_init(|| { zcode_tools::tls::client_builder().connect_timeout(Duration::from_secs(10)).build().unwrap() }).clone()
 }
 
 /// Request body; fields in alphabetical order so the bytes equal what a `json!` map (sorted keys) produced.
@@ -216,7 +216,7 @@ impl Client {
                         Some(LlmError::Overflow(_)) => false,
                         Some(LlmError::Http(c, _)) => *c == 429 || *c >= 500,
                         Some(_) => true,
-                        None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request() || r.is_body()),
+                        None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| (r.is_connect() || r.is_timeout() || r.is_request() || r.is_body()) && !zcode_tools::tls::is_certificate_error(r)),
                     };
                     if !retryable || emitted.load(std::sync::atomic::Ordering::Relaxed) || tries >= 4 { return Err(e); }
                     e.to_string()
@@ -239,7 +239,8 @@ impl Client {
         if !self.cfg.api_key.is_empty() {
             rb = rb.bearer_auth(&self.cfg.api_key);
         }
-        let resp = rb.send().await?;
+        // keep the reqwest error inside (the retry logic looks for it) but show its root cause, e.g. a rejected certificate
+        let resp = rb.send().await.map_err(|e| { let msg = zcode_tools::tls::explain(&e); anyhow::Error::new(e).context(msg) })?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();

@@ -7,15 +7,14 @@ use serde_json::Value;
 fn client() -> Result<&'static reqwest::Client> {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(c) = C.get() { return Ok(c); }
-    crate::init_tls();
-    let c = reqwest::Client::builder().user_agent("zcode/0.1").build()?;
+    let c = crate::tls::client_builder().user_agent("zcode/0.1").build()?;
     Ok(C.get_or_init(|| c))
 }
 
 pub async fn fetch(a: &Value) -> Result<String> {
     let url = s(a, "url")?;
     if !url.starts_with("http") { bail!("url must be http(s)"); }
-    let r = client()?.get(url).timeout(std::time::Duration::from_secs(20)).send().await?;
+    let r = client()?.get(url).timeout(std::time::Duration::from_secs(20)).send().await.map_err(|e| anyhow::anyhow!(crate::tls::explain(&e)))?;
     if !r.status().is_success() { bail!("HTTP {}", r.status()); }
     let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let body = r.text().await?;
@@ -45,7 +44,7 @@ pub async fn search(a: &Value) -> Result<String> {
         .timeout(std::time::Duration::from_secs(25))
         .header("accept", "application/json, text/event-stream")
         .json(&body)
-        .send().await?;
+        .send().await.map_err(|e| anyhow::anyhow!(crate::tls::explain(&e)))?;
     if !r.status().is_success() { bail!("HTTP {}", r.status()); }
     parse_response(&r.text().await?)
 }

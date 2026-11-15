@@ -120,8 +120,7 @@ fn parse_challenge(h: &str) -> Option<Vec<(String, String)>> {
 
 impl Reg {
     fn new(r: &Ref) -> Result<Reg, String> {
-        crate::init_tls();
-        let http = reqwest::Client::builder().user_agent(concat!("zcode/", env!("CARGO_PKG_VERSION")))
+        let http = crate::tls::client_builder().user_agent(concat!("zcode/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(20)).read_timeout(Duration::from_secs(60)).build().map_err(|e| e.to_string())?;
         let scheme = if loopback(&r.endpoint) { "http" } else { "https" };
         Ok(Reg { http, base: format!("{scheme}://{}", r.endpoint), repo: r.repo.clone(), token: Default::default() })
@@ -143,7 +142,7 @@ impl Reg {
             if let Some(s) = get("service") { q.append_pair("service", &s); }
             q.append_pair("scope", &get("scope").unwrap_or_else(|| format!("repository:{}:pull", self.repo)));
         }
-        let r = self.http.get(url).send().await.map_err(|e| format!("token request failed: {e}"))?;
+        let r = self.http.get(url).send().await.map_err(|e| format!("token request failed: {}", crate::tls::explain(&e)))?;
         if !r.status().is_success() { return Err(format!("token request failed: HTTP {} (private images need credentials, which are not supported)", r.status())); }
         let v: Value = r.json().await.map_err(|e| format!("bad token response: {e}"))?;
         let t = v["token"].as_str().or_else(|| v["access_token"].as_str()).ok_or("token response has no token")?;
@@ -156,7 +155,7 @@ impl Reg {
         for attempt in 0..2 {
             let mut rq = self.http.get(&url).header(reqwest::header::ACCEPT, accept);
             if let Some(t) = self.token.lock().await.as_ref() { rq = rq.bearer_auth(t); }
-            let r = rq.send().await.map_err(|e| format!("{url}: {e}"))?;
+            let r = rq.send().await.map_err(|e| format!("{url}: {}", crate::tls::explain(&e)))?;
             if r.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
                 let ch = r.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 self.authenticate(&ch).await?;

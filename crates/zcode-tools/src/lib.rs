@@ -20,12 +20,10 @@ mod pathguard {
         pub fn canon_of(&self, _: &File) -> Option<PathBuf> { None }
     }
 }
-/// Install the `ring` crypto provider for rustls (once). Call before building the first `reqwest::Client`.
 #[cfg(any(feature = "web", feature = "oci"))]
-pub fn init_tls() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
-}
+pub mod tls;
+#[cfg(any(feature = "web", feature = "oci"))]
+pub use tls::init_tls;
 pub mod frames;
 pub mod img;
 pub mod sandbox;
